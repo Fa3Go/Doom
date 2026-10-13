@@ -1,0 +1,1073 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>毀滅戰士 JS</title>
+<style>
+/* Layout: one full-bleed canvas, letterboxed at 4:3, touch controls float above it. Single dark look by choice. */
+:root {
+  --void: #000000;
+  --blood: #c8160e;
+  --brass: #e8b422;
+  --steel: #3a3833;
+  --bone: #f2e8d5;
+  --font-ui: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif;
+  color-scheme: dark;
+}
+html, body { margin: 0; height: 100%; background: var(--void); color: var(--bone); overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
+#screen { display: block; width: 100%; height: 100%; cursor: crosshair; }
+#touch { position: fixed; right: 0; bottom: 0; padding: 0 calc(16px + env(safe-area-inset-right, 0px)) calc(16px + env(safe-area-inset-bottom, 0px)) 0; display: flex; gap: 12px; align-items: flex-end; }
+#touch[hidden] { display: none; }
+#touch button {
+  font: 700 16px var(--font-ui); color: var(--bone); background: rgba(58, 56, 51, 0.55);
+  border: 2px solid rgba(242, 232, 213, 0.5); border-radius: 50%; width: 64px; height: 64px; touch-action: none;
+}
+#touch #btnFire { width: 84px; height: 84px; background: rgba(200, 22, 14, 0.55); border-color: rgba(232, 180, 34, 0.8); }
+#touch button:focus-visible { outline: 3px solid var(--brass); }
+</style>
+
+<canvas id="screen" aria-label="毀滅戰士遊戲畫面"></canvas>
+<div id="touch" hidden>
+  <button id="btnSwap" type="button">換槍</button>
+  <button id="btnFire" type="button">開火</button>
+</div>
+
+<script>
+'use strict';
+// ============================================================
+//  毀滅戰士 JS — 單檔光線投射 (raycasting) 射擊遊戲
+// ============================================================
+const W = 320, H = 240, VH = 200, HALF = VH / 2, TS = 64;
+const canvas = document.getElementById('screen');
+const sctx = canvas.getContext('2d');
+const buf = document.createElement('canvas'); buf.width = W; buf.height = H;
+const bctx = buf.getContext('2d');
+const img = bctx.createImageData(W, VH);
+const pix = new Uint32Array(img.data.buffer);
+const zbuf = new Float32Array(W);
+const isTouch = window.matchMedia ? matchMedia('(pointer: coarse)').matches : 'ontouchstart' in window;
+
+// ---------- 工具 ----------
+function rgb(r, g, b) { return (255 << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255); }
+function shade(c, f) {
+  const r = (c & 255) * f, g = ((c >> 8) & 255) * f, b = ((c >> 16) & 255) * f;
+  return (255 << 24) | (b << 16) | (g << 8) | r;
+}
+function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const rand = Math.random;
+const randInt = (a, b) => a + Math.floor(rand() * (b - a + 1));
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const fog = d => clamp(1.15 - d / 13, 0.1, 1);
+
+// ---------- 材質產生 ----------
+function makeTex(fn) { const t = new Uint32Array(TS * TS); for (let y = 0; y < TS; y++) for (let x = 0; x < TS; x++) t[y * TS + x] = fn(x, y); return t; }
+function canvasTex(size, draw) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  const g = c.getContext('2d'); draw(g);
+  return new Uint32Array(g.getImageData(0, 0, size, size).data.buffer.slice(0));
+}
+const TEX = {};
+(function buildTextures() {
+  let R = rng(7);
+  // 1 紅磚
+  TEX[1] = makeTex((x, y) => {
+    const row = y >> 3, off = (row & 1) * 8;
+    if ((y & 7) === 0 || ((x + off) & 15) === 0) return rgb(70, 64, 58);
+    const n = R() * 35; return rgb(130 + n, 46 + n * 0.5, 32 + n * 0.3);
+  });
+  // 2 石塊
+  TEX[2] = makeTex((x, y) => {
+    const row = y >> 4, off = (row & 1) * 16;
+    if ((y & 15) === 0 || ((x + off) & 31) === 0) return rgb(40, 40, 42);
+    const n = R() * 40 + Math.sin(x * 0.7 + y * 0.3) * 6; return rgb(100 + n, 98 + n, 92 + n);
+  });
+  // 3 科技金屬板
+  TEX[3] = makeTex((x, y) => {
+    const px = x & 31, py = y & 31, c = 78 + R() * 14;
+    if (px === 0 || py === 0) return rgb(28, 28, 36);
+    if (px === 31 || py === 31) return rgb(140, 142, 160);
+    if ((px === 4 || px === 27) && (py === 4 || py === 27)) return rgb(210, 210, 220);
+    if (y >= 29 && y <= 34 && x > 8 && x < 56) return ((x >> 2) & 1) ? rgb(60, 210, 255) : rgb(20, 120, 190);
+    return rgb(c, c + 4, c + 18);
+  });
+  // 4 門
+  TEX[4] = makeTex((x, y) => {
+    if (x < 5 || x > 58) return (((y >> 2) + (x < 5 ? 0 : 1)) & 1) ? rgb(230, 180, 0) : rgb(20, 20, 20);
+    if (y > 27 && y < 37) return (x & 7) === 0 ? rgb(60, 60, 70) : rgb(125, 125, 135);
+    const n = R() * 18;
+    if (x % 9 === 0) return rgb(55, 38, 20);
+    return rgb(115 + n, 78 + n * 0.6, 40 + n * 0.3);
+  });
+  // 5 出口開關
+  TEX[5] = canvasTex(TS, g => {
+    g.fillStyle = '#5a5e6a'; g.fillRect(0, 0, 64, 64);
+    g.fillStyle = '#2a2c34'; g.fillRect(0, 0, 64, 2); g.fillRect(0, 62, 64, 2);
+    g.fillStyle = '#111'; g.fillRect(8, 6, 48, 18);
+    g.fillStyle = '#2f2'; g.font = 'bold 14px monospace'; g.textAlign = 'center'; g.fillText('EXIT', 32, 20);
+    g.fillStyle = '#222'; g.fillRect(20, 30, 24, 28);
+    g.fillStyle = '#888'; g.fillRect(23, 33, 18, 22);
+    g.fillStyle = '#d22'; g.fillRect(28, 36, 8, 10);
+    g.fillStyle = '#ccc'; g.fillRect(30, 46, 4, 8);
+  });
+  // 6 血肉牆
+  R = rng(99);
+  TEX[6] = makeTex((x, y) => {
+    const v = Math.sin(x * 0.25 + Math.sin(y * 0.18) * 3) + Math.sin(y * 0.31 + x * 0.05) * 0.6;
+    const n = R() * 30;
+    if (Math.abs(v) < 0.12) return rgb(60 + n, 8, 10);
+    if (Math.abs(v - 1) < 0.08) return rgb(200, 150 + n, 120);
+    return rgb(120 + n + v * 15, 30 + n * 0.3, 28 + n * 0.3);
+  });
+  // 地板 / 天花板
+  R = rng(3);
+  TEX.floor = makeTex((x, y) => {
+    if ((x & 31) === 0 || (y & 31) === 0) return rgb(30, 28, 24);
+    const n = R() * 22; const s = ((x >> 5) + (y >> 5)) & 1 ? 8 : 0;
+    return rgb(66 + n + s, 60 + n + s, 50 + n);
+  });
+  TEX.ceil = makeTex((x, y) => {
+    const px = x & 31, py = y & 31;
+    if (px > 11 && px < 20 && py > 11 && py < 20) return rgb(255, 250, 210);
+    if (px === 0 || py === 0) return rgb(25, 25, 28);
+    const n = R() * 14; return rgb(54 + n, 54 + n, 58 + n);
+  });
+})();
+const WALLCHAR = { '#': 1, 'S': 2, 'T': 3, 'D': 4, 'X': 5, 'F': 6 };
+const DOOR = 4, EXIT = 5;
+
+// ---------- 精靈圖 ----------
+const SPR = {};
+function spr(draw) { return canvasTex(TS, g => { g.lineWidth = 1; draw(g); }); }
+function circle(g, x, y, r, c) { g.fillStyle = c; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
+function spike(g, x, y, dir) { g.beginPath(); g.moveTo(x - 2, y); g.lineTo(x + 2, y); g.lineTo(x + dir * 4, y - 6); g.closePath(); g.fill(); }
+
+const MONSTER_LOOK = {
+  zombie: { skin: '#9a9a78', body: '#4d5b2c', dark: '#2a3518', eye: '#d00' },
+  imp:    { skin: '#8b5a2b', body: '#6e3c1c', dark: '#3b1a0b', eye: '#ff3' },
+  demon:  { skin: '#e08a9a', body: '#c9677c', dark: '#7a2d3f', eye: '#f22' },
+  baron:  { skin: '#c9a27a', body: '#9a3b2a', dark: '#3c5a2a', eye: '#3f3' },
+};
+function drawMonster(g, type, frame) {
+  const L = MONSTER_LOOK[type];
+  if (frame === 4) { // 屍體
+    g.fillStyle = '#6a0000'; g.beginPath(); g.ellipse(32, 59, 27, 5, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = L.body; g.fillRect(12, 53, 34, 7);
+    g.fillStyle = L.dark; g.fillRect(8, 55, 8, 5);
+    circle(g, 50, 55, 5, L.skin);
+    g.fillStyle = '#b00'; g.fillRect(22, 52, 12, 4); g.fillRect(40, 57, 6, 3);
+    return;
+  }
+  if (type === 'demon') {
+    const step = frame === 1 ? 3 : 0;
+    g.fillStyle = L.dark; g.fillRect(18 - step, 44, 9, 18); g.fillRect(37 + step, 44, 9, 18);
+    g.fillStyle = L.body; g.beginPath(); g.ellipse(32, 36, 20, 15, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = L.skin; g.beginPath(); g.ellipse(32, 30, 15, 9, 0, 0, Math.PI * 2); g.fill();
+    // 大嘴
+    g.fillStyle = '#300'; g.beginPath(); g.ellipse(32, 36, 11, frame === 2 ? 10 : 5, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#fff'; for (let i = 0; i < 6; i++) { g.fillRect(23 + i * 3.4, 32, 2, 3); g.fillRect(23 + i * 3.4, frame === 2 ? 42 : 38, 2, 3); }
+    g.fillStyle = L.eye; g.fillRect(24, 24, 4, 3); g.fillRect(36, 24, 4, 3);
+    g.fillStyle = '#ddc'; spike(g, 20, 22, -1); spike(g, 44, 22, 1);
+    g.fillStyle = L.body; g.fillRect(10, 34 + (frame === 2 ? -8 : 0), 6, 14); g.fillRect(48, 34 + (frame === 2 ? -8 : 0), 6, 14);
+  } else {
+    const big = type === 'baron';
+    const step = frame === 1 ? 3 : 0;
+    g.fillStyle = L.dark; g.fillRect(24 - step, 40, 7, 22); g.fillRect(33 + step, 40, 7, 22);
+    g.fillStyle = big ? '#2a1a10' : '#222'; g.fillRect(22 - step, 59, 10, 5); g.fillRect(32 + step, 59, 10, 5);
+    g.fillStyle = L.body; g.fillRect(20, 20, 24, 22);
+    g.fillStyle = 'rgba(0,0,0,0.3)'; g.fillRect(31, 20, 2, 20);
+    g.fillStyle = '#333'; g.fillRect(20, 38, 24, 3);
+    circle(g, 32, 13, 8, L.skin);
+    g.fillStyle = L.eye; g.fillRect(27, 11, 4, 2); g.fillRect(33, 11, 4, 2);
+    g.fillStyle = '#300'; g.fillRect(29, 16, 6, 2);
+    if (type === 'imp' || big) {
+      g.fillStyle = '#ddc';
+      spike(g, 22, 22, -1); spike(g, 42, 22, 1); spike(g, 21, 31, -1); spike(g, 43, 31, 1);
+      if (big) { g.fillStyle = '#eee'; spike(g, 25, 8, -1); spike(g, 39, 8, 1); spike(g, 23, 6, -1); spike(g, 41, 6, 1); }
+      else { spike(g, 27, 6, -1); spike(g, 37, 6, 1); }
+    }
+    if (frame === 2) {
+      if (type === 'zombie') {
+        g.fillStyle = L.body; g.fillRect(17, 22, 6, 8); g.fillRect(41, 22, 6, 8);
+        g.fillStyle = '#222'; g.fillRect(25, 26, 14, 5);
+        circle(g, 32, 29, 6, '#ff0'); circle(g, 32, 29, 3, '#fff');
+      } else {
+        const fire = big ? '#3f3' : '#f80', core = big ? '#cfc' : '#ff0';
+        g.fillStyle = L.skin; g.fillRect(12, 8, 6, 16); g.fillRect(46, 8, 6, 16);
+        circle(g, 15, 7, 6, fire); circle(g, 15, 7, 3, core);
+      }
+    } else {
+      g.fillStyle = type === 'zombie' ? L.body : L.skin;
+      g.fillRect(14, 22, 6, 18); g.fillRect(44, 22, 6, 18);
+      if (type === 'zombie') { g.fillStyle = '#222'; g.fillRect(42, 30, 4, 16); }
+      else { g.fillStyle = '#eee'; g.fillRect(13, 39, 2, 3); g.fillRect(17, 39, 2, 3); g.fillRect(45, 39, 2, 3); g.fillRect(49, 39, 2, 3); }
+    }
+  }
+  if (frame === 3) {
+    g.globalCompositeOperation = 'source-atop'; g.fillStyle = 'rgba(255,40,40,0.5)'; g.fillRect(0, 0, 64, 64);
+    g.globalCompositeOperation = 'source-over';
+  }
+}
+(function buildSprites() {
+  for (const t of Object.keys(MONSTER_LOOK)) { SPR[t] = []; for (let f = 0; f < 5; f++) SPR[t].push(spr(g => drawMonster(g, t, f))); }
+  SPR.health = spr(g => { g.fillStyle = '#eee'; g.fillRect(20, 46, 24, 17); g.fillStyle = '#d00'; g.fillRect(29, 48, 6, 13); g.fillRect(24, 52, 16, 5); g.fillStyle = '#999'; g.fillRect(20, 61, 24, 2); });
+  SPR.bullets = spr(g => { g.fillStyle = '#5b4a2a'; g.fillRect(22, 52, 20, 11); g.fillStyle = '#e8b422'; for (let i = 0; i < 5; i++) { g.fillRect(24 + i * 3.5, 46, 2, 7); } g.fillStyle = '#b48a1a'; for (let i = 0; i < 5; i++) g.fillRect(24 + i * 3.5, 46, 2, 2); });
+  SPR.shells = spr(g => { g.fillStyle = '#7a2222'; g.fillRect(18, 52, 28, 11); g.fillStyle = '#d33'; for (let i = 0; i < 4; i++) g.fillRect(21 + i * 6, 45, 4, 8); g.fillStyle = '#e8b422'; for (let i = 0; i < 4; i++) g.fillRect(21 + i * 6, 51, 4, 2); });
+  SPR.shotgun = spr(g => { g.fillStyle = '#333'; g.fillRect(6, 54, 44, 4); g.fillStyle = '#6b4220'; g.fillRect(40, 53, 18, 7); g.fillRect(22, 57, 12, 4); g.fillStyle = '#777'; g.fillRect(6, 54, 44, 1); });
+  SPR.chaingun = spr(g => { g.fillStyle = '#444'; g.fillRect(8, 50, 40, 10); g.fillStyle = '#222'; for (let i = 0; i < 3; i++) g.fillRect(2, 51 + i * 3, 10, 2); g.fillStyle = '#666'; g.fillRect(44, 48, 14, 14); g.fillStyle = '#999'; g.fillRect(8, 50, 40, 2); });
+  SPR.armor = spr(g => { g.fillStyle = '#2a8a2a'; g.beginPath(); g.moveTo(20, 42); g.lineTo(28, 40); g.lineTo(32, 45); g.lineTo(36, 40); g.lineTo(44, 42); g.lineTo(43, 63); g.lineTo(21, 63); g.closePath(); g.fill(); g.fillStyle = '#5c5'; g.fillRect(24, 48, 16, 3); g.fillRect(24, 54, 16, 3); });
+  SPR.barrel = spr(g => { g.fillStyle = '#3d6b2a'; g.fillRect(20, 30, 24, 34); g.fillStyle = '#2a4a1d'; g.fillRect(20, 38, 24, 3); g.fillRect(20, 54, 24, 3); g.fillStyle = '#5a9a3a'; g.fillRect(23, 30, 4, 34); g.fillStyle = '#7f7'; g.beginPath(); g.ellipse(32, 31, 11, 3, 0, 0, Math.PI * 2); g.fill(); g.fillStyle = '#ddd'; g.font = 'bold 9px monospace'; g.fillText('☢', 27, 51); });
+  SPR.explode = [0, 1, 2].map(f => spr(g => { const r = 12 + f * 9; circle(g, 32, 64 - r - 2, r, f === 2 ? '#a30' : '#f60'); circle(g, 32, 64 - r - 2, r * 0.7, f === 2 ? '#d50' : '#fa0'); circle(g, 32, 64 - r - 2, r * 0.35, '#ffd'); }));
+  SPR.fireball = [0, 1].map(f => spr(g => { circle(g, 32, 32, 22 - f * 3, '#f40'); circle(g, 32, 32, 15, '#fa0'); circle(g, 32 + f * 3, 30, 8, '#ffe'); }));
+  SPR.greenball = [0, 1].map(f => spr(g => { circle(g, 32, 32, 22 - f * 3, '#0a0'); circle(g, 32, 32, 15, '#4f4'); circle(g, 32 + f * 3, 30, 8, '#efe'); }));
+  SPR.puff = [0, 1].map(f => spr(g => { circle(g, 32, 32, 14 + f * 8, f ? 'rgba(160,160,160,0.9)' : '#ddd'); if (!f) circle(g, 32, 32, 7, '#ff8'); }));
+  SPR.blood = [0, 1].map(f => spr(g => { circle(g, 32, 32, 12 + f * 6, '#b00'); circle(g, 22, 38, 6, '#800'); circle(g, 42, 24, 5, '#d00'); }));
+})();
+
+// ---------- 關卡資料 ----------
+const LEVELS = [
+{ name: '第一關:機庫', map: [
+"TTTTTTTTTTTTTTTTTTTTTTTT",
+"T......T.........T.....T",
+"T.P....T...z.....T..i..T",
+"T......D.........D.....T",
+"T..h...T....b....T.....T",
+"T......T.........TTTDTTT",
+"TTTDTTTTTTTTDTTTTT.....T",
+"#.....#.....#....T..s..T",
+"#.....#..g..#.z..T.....T",
+"#..z..D.....D....D..z..T",
+"#.....#.....#....T.....T",
+"#..a..#..b..#.a..TTTDTTT",
+"###D####D#####D###.....#",
+"#.......#.......#...h..#",
+"#..i....#...z...D..r...#",
+"#.......D.......#.....i#",
+"#..b....#...h...###D####",
+"#.......#.......#...i..X",
+"#..z....#...i...#......#",
+"########################"] },
+{ name: '第二關:地獄入口', map: [
+"FFFFFFFFFFFFFFFFFFFFFFFF",
+"F.....S...........S....F",
+"F..P..S...i...i...S.d..F",
+"F.....D.....b.....D....F",
+"F..s..S...........S..h.F",
+"F.....S...z...z...S....F",
+"FSSDSSSSSSSSDSSSSSSSDSSF",
+"F.....F.........F......F",
+"F..i..F..SSDSS..F...i..F",
+"F.....D..S...S..D......F",
+"F..d..F..S.c.S..F..b...F",
+"F.....F..SSSSS..F...d..F",
+"F..a..F....h....F......F",
+"FFFDFFFFFFFDFFFFFFFFDFFF",
+"F......F........F......F",
+"F..i...D...d....D...i..F",
+"F...b..F..s..h..F......F",
+"F......F........F..r...F",
+"F..d...F...i....F...d..X",
+"FFFFFFFFFFFFFFFFFFFFFFFF"] },
+{ name: '第三關:魔王巢穴', boss: true, map: [
+"FFFFFFFFFFFFFFFFFFFFFFFF",
+"F......F.......F.......F",
+"F..P...F..h.a..F..s.r..F",
+"F......F.......F.......F",
+"F..c...D...g...D.......F",
+"F......F.......F.......F",
+"FFFDFFFFFFFDFFFFFFFDFFFF",
+"F......................F",
+"F..i..F....d.....F..i..F",
+"F.....F..........F.....F",
+"F..b.......B.........b.F",
+"F.....F..........F.....F",
+"F..i..F.....d....F..i..F",
+"F......................F",
+"F...h.....s..a.....h...X",
+"FFFFFFFFFFFFFFFFFFFFFFFF"] },
+];
+
+const MDEF = {
+  zombie: { hp: 20,  speed: 1.3, attack: 'hitscan',  dmg: [3, 12],  cool: 1.6, range: 14, pain: 0.7, scale: 1,    width: 0.45, drop: 'bullets' },
+  imp:    { hp: 60,  speed: 1.6, attack: 'fireball', dmg: [8, 20],  cool: 2.0, range: 16, pain: 0.45, scale: 1,   width: 0.45 },
+  demon:  { hp: 150, speed: 2.8, attack: 'melee',    dmg: [10, 28], cool: 0.9, range: 1.3, pain: 0.3, scale: 1,   width: 0.6 },
+  baron:  { hp: 700, speed: 1.5, attack: 'fireball', dmg: [20, 40], cool: 1.4, range: 20, pain: 0.1, scale: 1.5, width: 0.5, boss: true },
+};
+const WEAPONS = {
+  1: { name: '手槍',   ammo: 'bullets', cd: 0.38, pellets: 1, spread: 1,  dmg: [6, 15] },
+  2: { name: '霰彈槍', ammo: 'shells',  cd: 0.9,  pellets: 7, spread: 26, dmg: [6, 15] },
+  3: { name: '機槍',   ammo: 'bullets', cd: 0.1,  pellets: 1, spread: 8,  dmg: [6, 15] },
+};
+const MAXAMMO = { bullets: 200, shells: 50 };
+
+// ---------- 遊戲狀態 ----------
+let state = 'title'; // title | play | paused | dead | levelDone | victory
+let levelIdx = 0, map, MW, MH, doors, ents, player, levelTime = 0, totalMonsters = 0;
+let carry = null; // 跨關保留的玩家狀態
+let messages = [], flashRed = 0, flashGold = 0, showMap = false, bossAlive = false;
+let weaponKick = 0, muzzle = 0, bobT = 0, moveAmt = 0, faceTimer = 0, faceLook = 0, grin = 0;
+
+function freshPlayer() {
+  return { health: 100, armor: 0, ammo: { bullets: 50, shells: 0 }, weapons: { 1: true, 2: false, 3: false }, cur: 1 };
+}
+function loadLevel(i) {
+  levelIdx = i;
+  const L = LEVELS[i];
+  MH = L.map.length; MW = L.map[0].length;
+  map = new Uint8Array(MW * MH); doors = new Map(); ents = [];
+  if (!carry) carry = freshPlayer();
+  const c = JSON.parse(JSON.stringify(carry));
+  player = Object.assign(c, { x: 1.5, y: 1.5, a: 0, cd: 0, kills: 0, dead: false });
+  totalMonsters = 0; bossAlive = false;
+  const mtype = { z: 'zombie', i: 'imp', d: 'demon', B: 'baron' };
+  const ptype = { h: 'health', a: 'bullets', s: 'shells', g: 'shotgun', c: 'chaingun', r: 'armor' };
+  for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
+    const ch = L.map[y][x];
+    if (WALLCHAR[ch]) map[y * MW + x] = WALLCHAR[ch];
+    const cx = x + 0.5, cy = y + 0.5;
+    if (ch === 'P') { player.x = cx; player.y = cy; player.a = facingOpen(x, y, L.map); }
+    else if (mtype[ch]) { addMonster(mtype[ch], cx, cy); }
+    else if (ptype[ch]) ents.push({ kind: 'pickup', type: ptype[ch], x: cx, y: cy });
+    else if (ch === 'b') ents.push({ kind: 'barrel', x: cx, y: cy, hp: 20, boom: -1 });
+  }
+  levelTime = 0; messages = []; flashRed = flashGold = 0;
+  say(L.name, 3);
+  if (L.boss) say('擊敗地獄男爵才能打開出口!', 4);
+}
+function facingOpen(x, y, m) {
+  const dirs = [[1, 0, 0], [0, 1, Math.PI / 2], [-1, 0, Math.PI], [0, -1, -Math.PI / 2]];
+  for (const [dx, dy, a] of dirs) if (m[y + dy][x + dx] === '.') return a;
+  return 0;
+}
+function addMonster(type, x, y) {
+  const d = MDEF[type];
+  ents.push({ kind: 'monster', type, def: d, x, y, hp: d.hp, state: 'idle', timer: 0, cool: rand() * d.cool, anim: rand() * 2, fired: false, side: 0, sideT: 0 });
+  totalMonsters++;
+  if (d.boss) bossAlive = true;
+}
+function say(text, t = 2.5) { messages.push({ text, t }); if (messages.length > 4) messages.shift(); }
+
+// ---------- 地圖查詢 ----------
+function tileAt(x, y) { return (x < 0 || y < 0 || x >= MW || y >= MH) ? 1 : map[y * MW + x]; }
+function solidAt(x, y, r) {
+  return tileAt(Math.floor(x - r), Math.floor(y - r)) || tileAt(Math.floor(x + r), Math.floor(y - r)) ||
+         tileAt(Math.floor(x - r), Math.floor(y + r)) || tileAt(Math.floor(x + r), Math.floor(y + r));
+}
+function lineOfSight(x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0, steps = Math.ceil(Math.hypot(dx, dy) * 4);
+  for (let i = 1; i < steps; i++) { const t = i / steps; if (tileAt(Math.floor(x0 + dx * t), Math.floor(y0 + dy * t))) return false; }
+  return true;
+}
+function openDoor(x, y) {
+  if (tileAt(x, y) !== DOOR) return;
+  const k = y * MW + x;
+  if (!doors.has(k)) { doors.set(k, 0); sfx('door', volAt(x + 0.5, y + 0.5)); }
+}
+function blockedByEnt(x, y, self) {
+  for (const e of ents) {
+    if (e === self) continue;
+    if ((e.kind === 'monster' && e.state !== 'dead') || (e.kind === 'barrel' && e.boom < 0)) {
+      if (Math.abs(e.x - x) < 0.55 && Math.abs(e.y - y) < 0.55) return true;
+    }
+  }
+  return false;
+}
+function moveEnt(e, dx, dy, r, isPlayer) {
+  let moved = false;
+  const nx = e.x + dx, ny = e.y + dy;
+  if (!solidAt(nx, e.y, r) && !(isPlayer && blockedByEnt(nx, e.y, e) && !blockedByEnt(e.x, e.y, e))) { e.x = nx; moved = true; }
+  if (!solidAt(e.x, ny, r) && !(isPlayer && blockedByEnt(e.x, ny, e) && !blockedByEnt(e.x, e.y, e))) { e.y = ny; moved = true; }
+  return moved;
+}
+
+// ---------- 音效 (WebAudio 合成) ----------
+let actx = null, master = null, noiseBuffer = null;
+function initAudio() {
+  try {
+    if (!actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      master = actx.createGain(); master.gain.value = 0.5; master.connect(actx.destination);
+      noiseBuffer = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+      const d = noiseBuffer.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (actx.state === 'suspended') actx.resume();
+  } catch (e) { actx = null; }
+}
+function tone(type, f0, f1, dur, vol, delay = 0) {
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(master); o.start(t); o.stop(t + dur + 0.05);
+}
+function noise(dur, freq, vol, delay = 0) {
+  const t = actx.currentTime + delay, s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  s.buffer = noiseBuffer; f.type = 'lowpass'; f.frequency.value = freq;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f).connect(g).connect(master); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.05);
+}
+function volAt(x, y) { return player ? clamp(1 - Math.hypot(x - player.x, y - player.y) / 18, 0, 1) : 1; }
+function sfx(name, v = 1) {
+  if (!actx || v <= 0.01) return;
+  switch (name) {
+    case 'pistol': noise(0.18, 2500, 0.6 * v); tone('square', 180, 60, 0.08, 0.15 * v); break;
+    case 'shotgun': noise(0.45, 1300, 0.9 * v); tone('sine', 110, 40, 0.3, 0.6 * v); break;
+    case 'chaingun': noise(0.1, 2800, 0.45 * v); break;
+    case 'enemyShot': noise(0.15, 1800, 0.4 * v); break;
+    case 'fireball': tone('sawtooth', 300, 60, 0.45, 0.18 * v); noise(0.4, 700, 0.2 * v); break;
+    case 'explode': noise(0.9, 500, 1.0 * v); tone('sine', 80, 25, 0.7, 0.7 * v); break;
+    case 'hurt': tone('square', 240, 90, 0.22, 0.22 * v); break;
+    case 'die': tone('sawtooth', 320, 40, 0.6, 0.25 * v); noise(0.3, 600, 0.2 * v, 0.1); break;
+    case 'pain': tone('square', 420, 180, 0.15, 0.15 * v); break;
+    case 'alert': tone('sawtooth', 120, 260, 0.35, 0.2 * v); tone('sawtooth', 125, 240, 0.35, 0.15 * v, 0.05); break;
+    case 'melee': noise(0.12, 900, 0.5 * v); tone('square', 90, 50, 0.15, 0.3 * v); break;
+    case 'pickup': tone('square', 660, 660, 0.06, 0.15); tone('square', 990, 990, 0.08, 0.15, 0.06); break;
+    case 'weapon': [523, 659, 784, 1046].forEach((f, i) => tone('square', f, f, 0.09, 0.14, i * 0.07)); break;
+    case 'door': noise(0.7, 260, 0.5 * v); tone('sawtooth', 55, 45, 0.6, 0.12 * v); break;
+    case 'click': tone('square', 1200, 800, 0.03, 0.1); break;
+    case 'exit': [392, 523, 659, 784, 1046].forEach((f, i) => tone('triangle', f, f, 0.2, 0.25, i * 0.12)); break;
+    case 'playerDie': tone('sawtooth', 300, 30, 1.2, 0.35); noise(0.8, 400, 0.3); break;
+  }
+}
+
+// ---------- 輸入 ----------
+const keys = {};
+let mouseDX = 0, firing = false, locked = false, everLocked = false, dragTurn = false;
+const touchMove = { id: null, ox: 0, oy: 0, dx: 0, dy: 0 }, touchLook = { id: null, lx: 0 };
+
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab'].includes(e.code)) e.preventDefault();
+  if (state === 'play') {
+    if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') selectWeapon(+e.code.slice(5));
+    if (e.code === 'KeyM' || e.code === 'Tab') showMap = !showMap;
+    if (e.code === 'KeyE') useAction();
+    if (e.code === 'KeyQ') cycleWeapon();
+  } else if ((e.code === 'Enter' || e.code === 'Space') && state !== 'play') { advanceScreen(); }
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; firing = false; });
+
+canvas.addEventListener('mousedown', e => {
+  if (isTouch && e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
+  if (state === 'play') {
+    if (!locked && !everLocked) requestLock();
+    if (e.button === 0) firing = true;
+    if (!locked) dragTurn = true;
+  }
+});
+addEventListener('mouseup', () => { firing = false; dragTurn = false; });
+addEventListener('mousemove', e => { if (locked || dragTurn) mouseDX += e.movementX || 0; });
+canvas.addEventListener('click', () => { if (state !== 'play') advanceScreen(); });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+function requestLock() {
+  if (isTouch || !canvas.requestPointerLock) return;
+  try { const p = canvas.requestPointerLock(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+}
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === canvas;
+  if (locked) { everLocked = true; if (state === 'paused') state = 'play'; }
+  else if (state === 'play' && everLocked) { state = 'paused'; firing = false; }
+});
+
+function advanceScreen() {
+  initAudio();
+  if (state === 'title') { carry = null; loadLevel(0); state = 'play'; requestLock(); }
+  else if (state === 'paused') { state = 'play'; requestLock(); }
+  else if (state === 'dead') { loadLevel(levelIdx); state = 'play'; requestLock(); }
+  else if (state === 'levelDone') { loadLevel(levelIdx + 1); state = 'play'; requestLock(); }
+  else if (state === 'victory') { state = 'title'; }
+  updateTouchUI();
+}
+
+// 觸控
+canvas.addEventListener('touchstart', e => {
+  initAudio();
+  if (state !== 'play') { e.preventDefault(); advanceScreen(); return; }
+  for (const t of e.changedTouches) {
+    if (t.clientX < innerWidth * 0.45 && touchMove.id === null) { touchMove.id = t.identifier; touchMove.ox = t.clientX; touchMove.oy = t.clientY; touchMove.dx = touchMove.dy = 0; }
+    else if (touchLook.id === null) { touchLook.id = t.identifier; touchLook.lx = t.clientX; }
+  }
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === touchMove.id) { touchMove.dx = clamp((t.clientX - touchMove.ox) / 50, -1, 1); touchMove.dy = clamp((t.clientY - touchMove.oy) / 50, -1, 1); }
+    else if (t.identifier === touchLook.id) { mouseDX += (t.clientX - touchLook.lx) * 2.2; touchLook.lx = t.clientX; }
+  }
+  e.preventDefault();
+}, { passive: false });
+function endTouch(e) {
+  for (const t of e.changedTouches) {
+    if (t.identifier === touchMove.id) { touchMove.id = null; touchMove.dx = touchMove.dy = 0; }
+    if (t.identifier === touchLook.id) touchLook.id = null;
+  }
+}
+canvas.addEventListener('touchend', endTouch); canvas.addEventListener('touchcancel', endTouch);
+const touchUI = document.getElementById('touch');
+const btnFire = document.getElementById('btnFire'), btnSwap = document.getElementById('btnSwap');
+btnFire.addEventListener('touchstart', e => { e.preventDefault(); firing = true; }, { passive: false });
+btnFire.addEventListener('touchend', e => { e.preventDefault(); firing = false; }, { passive: false });
+btnSwap.addEventListener('touchstart', e => { e.preventDefault(); cycleWeapon(); }, { passive: false });
+function updateTouchUI() { touchUI.hidden = !(isTouch && state === 'play'); }
+
+// ---------- 玩家動作 ----------
+function selectWeapon(n) {
+  if (!player.weapons[n] || player.cur === n) return;
+  player.cur = n; sfx('click'); weaponKick = 1;
+}
+function cycleWeapon() {
+  for (let i = 1; i <= 3; i++) { const n = (player.cur + i - 1) % 3 + 1; if (player.weapons[n] && player.ammo[WEAPONS[n].ammo] > 0) { selectWeapon(n); return; } }
+}
+function frontTile(d = 0.9) { return [Math.floor(player.x + Math.cos(player.a) * d), Math.floor(player.y + Math.sin(player.a) * d)]; }
+function useAction() {
+  const [tx, ty] = frontTile();
+  const t = tileAt(tx, ty);
+  if (t === DOOR) openDoor(tx, ty);
+  else if (t === EXIT) {
+    if (bossAlive) { say('出口被魔力封印了——先擊敗地獄男爵!'); sfx('click'); return; }
+    finishLevel();
+  }
+}
+function finishLevel() {
+  sfx('exit');
+  carry = { health: player.health, armor: player.armor, ammo: { ...player.ammo }, weapons: { ...player.weapons }, cur: player.cur };
+  if (document.pointerLockElement) document.exitPointerLock();
+  state = levelIdx + 1 >= LEVELS.length ? 'victory' : 'levelDone';
+  updateTouchUI();
+}
+function damagePlayer(dmg, srcX, srcY) {
+  if (player.dead) return;
+  const saved = Math.min(player.armor, Math.floor(dmg / 3));
+  player.armor -= saved; player.health -= dmg - saved;
+  flashRed = Math.min(0.75, flashRed + dmg / 40); faceTimer = 0.6;
+  if (srcX !== undefined) { const ang = Math.atan2(srcY - player.y, srcX - player.x) - player.a; faceLook = Math.sin(ang) > 0.3 ? 1 : Math.sin(ang) < -0.3 ? -1 : 0; }
+  if (player.health <= 0) {
+    player.health = 0; player.dead = true; sfx('playerDie');
+    state = 'dead'; firing = false;
+    if (document.pointerLockElement) document.exitPointerLock();
+    updateTouchUI();
+  } else sfx('hurt');
+}
+
+// 投影一個實體到螢幕(供渲染與命中判定共用)
+let cam = { dx: 1, dy: 0, px: 0, py: 0.66 };
+function project(e) {
+  const sx = e.x - player.x, sy = e.y - player.y;
+  const inv = 1 / (cam.px * cam.dy - cam.dx * cam.py);
+  const tx = inv * (cam.dy * sx - cam.dx * sy);
+  const ty = inv * (-cam.py * sx + cam.px * sy);
+  return { tx, ty, screenX: (W / 2) * (1 + tx / ty) };
+}
+function fireWeapon() {
+  const w = WEAPONS[player.cur];
+  if (player.ammo[w.ammo] <= 0) { sfx('click'); player.cd = 0.4; cycleWeapon(); return; }
+  player.ammo[w.ammo]--; player.cd = w.cd;
+  muzzle = 0.08; weaponKick = 1;
+  sfx(player.cur === 1 ? 'pistol' : player.cur === 2 ? 'shotgun' : 'chaingun');
+  // 喚醒附近怪物
+  for (const e of ents) if (e.kind === 'monster' && e.state === 'idle') {
+    const d = Math.hypot(e.x - player.x, e.y - player.y);
+    if (d < 9 || (d < 20 && lineOfSight(e.x, e.y, player.x, player.y))) wake(e);
+  }
+  const targets = ents.filter(e => (e.kind === 'monster' && e.state !== 'dead') || (e.kind === 'barrel' && e.boom < 0))
+    .map(e => ({ e, p: project(e) })).filter(o => o.p.ty > 0.2);
+  for (let i = 0; i < w.pellets; i++) {
+    const col = clamp(Math.round(W / 2 + (rand() * 2 - 1) * w.spread), 0, W - 1);
+    let best = null, bestD = zbuf[col];
+    for (const o of targets) {
+      const width = (VH / o.p.ty) * (o.e.kind === 'monster' ? o.e.def.width * o.e.def.scale : 0.4);
+      if (Math.abs(col - o.p.screenX) < width / 2 && o.p.ty < bestD) { best = o; bestD = o.p.ty; }
+    }
+    const dmg = randInt(w.dmg[0], w.dmg[1]);
+    if (best) {
+      hitEntity(best.e, dmg);
+      ents.push({ kind: 'fx', type: 'blood', x: best.e.x - cam.dx * 0.3, y: best.e.y - cam.dy * 0.3, t: 0, life: 0.25, z: 0.35 + rand() * 0.2, scale: 0.3 });
+      if (best.e.kind === 'barrel') ents[ents.length - 1].type = 'puff';
+    } else {
+      const camX = 2 * col / W - 1, d = zbuf[col] - 0.05;
+      if (d < 30) ents.push({ kind: 'fx', type: 'puff', x: player.x + (cam.dx + cam.px * camX) * d, y: player.y + (cam.dy + cam.py * camX) * d, t: 0, life: 0.25, z: 0.4 + (rand() - 0.5) * 0.2, scale: 0.25 });
+    }
+  }
+}
+function hitEntity(e, dmg) {
+  e.hp -= dmg;
+  if (e.kind === 'barrel') { if (e.hp <= 0 && e.boom < 0) e.boom = 0.12 + rand() * 0.08; return; }
+  if (e.state === 'dead') return;
+  if (e.hp <= 0) {
+    e.state = 'dead'; player.kills++; sfx('die', volAt(e.x, e.y));
+    if (e.def.drop) ents.push({ kind: 'pickup', type: e.def.drop, x: e.x + 0.15, y: e.y + 0.1, small: true });
+    if (e.def.boss) { bossAlive = false; say('地獄男爵已被擊敗!出口開啟了!', 4); }
+    return;
+  }
+  if (e.state === 'idle') wake(e);
+  if (rand() < e.def.pain) { e.state = 'pain'; e.timer = 0.25; sfx('pain', volAt(e.x, e.y) * 0.8); }
+}
+function wake(e) { if (e.state === 'idle') { e.state = 'chase'; sfx('alert', volAt(e.x, e.y) * 0.7); } }
+function explode(b) {
+  sfx('explode', volAt(b.x, b.y));
+  b.kind = 'fx'; b.type = 'explode'; b.t = 0; b.life = 0.45; b.z = 0; b.scale = 1.3;
+  for (const e of ents) {
+    if (e === b) continue;
+    const d = Math.hypot(e.x - b.x, e.y - b.y);
+    if (d < 2.8 && lineOfSight(b.x, b.y, e.x, e.y)) {
+      const dmg = Math.round((2.8 - d) / 2.8 * 110);
+      if (e.kind === 'monster' && e.state !== 'dead') hitEntity(e, dmg);
+      else if (e.kind === 'barrel' && e.boom < 0) e.boom = 0.15 + d * 0.05;
+    }
+  }
+  const pd = Math.hypot(player.x - b.x, player.y - b.y);
+  if (pd < 2.8 && lineOfSight(b.x, b.y, player.x, player.y)) damagePlayer(Math.round((2.8 - pd) / 2.8 * 90), b.x, b.y);
+}
+
+// ---------- 更新 ----------
+function update(dt) {
+  levelTime += dt;
+  // 轉向
+  let turn = mouseDX * 0.0028; mouseDX = 0;
+  if (keys.ArrowLeft) turn -= 2.6 * dt;
+  if (keys.ArrowRight) turn += 2.6 * dt;
+  player.a += turn;
+  // 移動
+  let fwd = 0, str = 0;
+  if (keys.KeyW || keys.ArrowUp) fwd += 1;
+  if (keys.KeyS || keys.ArrowDown) fwd -= 1;
+  if (keys.KeyD) str += 1;
+  if (keys.KeyA) str -= 1;
+  fwd -= touchMove.dy; str += touchMove.dx;
+  const len = Math.hypot(fwd, str);
+  if (len > 1) { fwd /= len; str /= len; }
+  const speed = (keys.ShiftLeft || keys.ShiftRight ? 5.2 : 3.4) * dt;
+  const ca = Math.cos(player.a), sa = Math.sin(player.a);
+  const mx = (ca * fwd - sa * str) * speed, my = (sa * fwd + ca * str) * speed;
+  moveEnt(player, mx, my, 0.25, true);
+  const moving = Math.hypot(fwd, str);
+  moveAmt += (clamp(moving, 0, 1) - moveAmt) * Math.min(1, dt * 8);
+  bobT += dt * 9 * moveAmt;
+  // 撞到門自動開啟、撞到出口觸發
+  if (fwd > 0.3) {
+    const [tx, ty] = frontTile(0.6);
+    const t = tileAt(tx, ty);
+    if (t === DOOR) openDoor(tx, ty);
+    else if (t === EXIT && !bossAlive) finishLevel();
+  }
+  if (state !== 'play') return;
+  // 門動畫
+  for (const [k, v] of doors) {
+    const nv = v + dt * 1.6;
+    if (nv >= 1) { map[k] = 0; doors.delete(k); } else doors.set(k, nv);
+  }
+  // 射擊
+  player.cd -= dt;
+  if (firing || keys.Space || keys.ControlLeft || keys.ControlRight) { if (player.cd <= 0) fireWeapon(); }
+  // 實體
+  for (const e of ents) {
+    if (e.kind === 'monster') updateMonster(e, dt);
+    else if (e.kind === 'proj') updateProj(e, dt);
+    else if (e.kind === 'fx') e.t += dt;
+    else if (e.kind === 'barrel' && e.boom >= 0) { e.boom -= dt; if (e.boom < 0) explode(e); }
+    else if (e.kind === 'pickup') {
+      if (Math.hypot(e.x - player.x, e.y - player.y) < 0.6) tryPickup(e);
+    }
+    if (state !== 'play') break;
+  }
+  ents = ents.filter(e => !e.remove && !(e.kind === 'fx' && e.t >= e.life));
+  // 畫面效果
+  flashRed = Math.max(0, flashRed - dt * 1.5);
+  flashGold = Math.max(0, flashGold - dt * 2);
+  weaponKick = Math.max(0, weaponKick - dt * 6);
+  muzzle = Math.max(0, muzzle - dt);
+  faceTimer = Math.max(0, faceTimer - dt);
+  grin = Math.max(0, grin - dt);
+  for (const m of messages) m.t -= dt;
+  messages = messages.filter(m => m.t > 0);
+}
+function tryPickup(e) {
+  const p = player; let msg = null, snd = 'pickup';
+  switch (e.type) {
+    case 'health': if (p.health < 100) { p.health = Math.min(100, p.health + 25); msg = '撿到醫療包 (+25)'; } break;
+    case 'bullets': if (p.ammo.bullets < MAXAMMO.bullets) { p.ammo.bullets = Math.min(MAXAMMO.bullets, p.ammo.bullets + (e.small ? 8 : 20)); msg = '撿到彈匣'; } break;
+    case 'shells': if (p.ammo.shells < MAXAMMO.shells) { p.ammo.shells = Math.min(MAXAMMO.shells, p.ammo.shells + 6); msg = '撿到一盒霰彈'; } break;
+    case 'armor': if (p.armor < 100) { p.armor = 100; msg = '撿到防彈衣!'; } break;
+    case 'shotgun':
+      p.ammo.shells = Math.min(MAXAMMO.shells, p.ammo.shells + 8);
+      if (!p.weapons[2]) { p.weapons[2] = true; p.cur = 2; grin = 1.5; snd = 'weapon'; }
+      msg = '撿到霰彈槍!'; break;
+    case 'chaingun':
+      p.ammo.bullets = Math.min(MAXAMMO.bullets, p.ammo.bullets + 30);
+      if (!p.weapons[3]) { p.weapons[3] = true; p.cur = 3; grin = 1.5; snd = 'weapon'; }
+      msg = '撿到機槍!'; break;
+  }
+  if (msg) { say(msg); sfx(snd); flashGold = 0.35; e.remove = true; }
+}
+function updateMonster(m, dt) {
+  if (m.state === 'dead') return;
+  const d = m.def;
+  const dx = player.x - m.x, dy = player.y - m.y, dist = Math.hypot(dx, dy);
+  const sees = dist < 22 && lineOfSight(m.x, m.y, player.x, player.y);
+  m.anim += dt * d.speed * 2.5;
+  if (m.state === 'idle') { if (sees) wake(m); return; }
+  if (m.state === 'pain') { m.timer -= dt; if (m.timer <= 0) m.state = 'chase'; return; }
+  if (m.state === 'attack') {
+    m.timer -= dt;
+    if (!m.fired && m.timer < 0.25) { m.fired = true; monsterAttack(m, dist, sees); }
+    if (m.timer <= 0) m.state = 'chase';
+    return;
+  }
+  // chase
+  m.cool -= dt;
+  const meleeRange = 1.3;
+  if (sees && m.cool <= 0) {
+    if (dist < meleeRange && d.attack !== 'hitscan') { startAttack(m); return; }
+    if (d.attack !== 'melee' && dist < d.range && rand() < dt * 2.5) { startAttack(m); return; }
+  }
+  if (dist > (d.attack === 'melee' ? 0.9 : 1.1)) {
+    let ang = Math.atan2(dy, dx);
+    if (m.sideT > 0) { m.sideT -= dt; ang += m.side; }
+    const step = d.speed * dt;
+    const ox = m.x, oy = m.y;
+    moveEnt(m, Math.cos(ang) * step, Math.sin(ang) * step, 0.3, false);
+    if (Math.abs(m.x - ox) + Math.abs(m.y - oy) < step * 0.3) {
+      const tx = Math.floor(m.x + Math.cos(ang) * 0.6), ty = Math.floor(m.y + Math.sin(ang) * 0.6);
+      if (tileAt(tx, ty) === DOOR) openDoor(tx, ty);
+      m.side = (rand() < 0.5 ? 1 : -1) * (Math.PI / 2); m.sideT = 0.4 + rand() * 0.6;
+    }
+  }
+}
+function startAttack(m) { m.state = 'attack'; m.timer = 0.5; m.fired = false; m.cool = m.def.cool * (0.7 + rand() * 0.6); }
+function monsterAttack(m, dist, sees) {
+  const d = m.def;
+  if (dist < 1.4 && d.attack !== 'hitscan') { sfx('melee', volAt(m.x, m.y)); damagePlayer(randInt(d.dmg[0], d.dmg[1]) * (d.attack === 'melee' ? 1 : 0.6) | 0, m.x, m.y); return; }
+  if (d.attack === 'melee') return;
+  if (d.attack === 'hitscan') {
+    sfx('enemyShot', volAt(m.x, m.y));
+    if (sees && rand() < clamp(0.95 - dist * 0.06, 0.25, 0.9)) damagePlayer(randInt(d.dmg[0], d.dmg[1]), m.x, m.y);
+  } else {
+    sfx('fireball', volAt(m.x, m.y));
+    const ang = Math.atan2(player.y - m.y, player.x - m.x);
+    const shots = d.boss ? [-0.12, 0, 0.12] : [0];
+    for (const off of shots) {
+      ents.push({ kind: 'proj', type: d.boss ? 'greenball' : 'fireball', x: m.x + Math.cos(ang) * 0.4, y: m.y + Math.sin(ang) * 0.4,
+        vx: Math.cos(ang + off) * (d.boss ? 7 : 6), vy: Math.sin(ang + off) * (d.boss ? 7 : 6), dmg: d.dmg, owner: m, t: 0, z: 0.3, scale: 0.4 });
+    }
+  }
+}
+function updateProj(p, dt) {
+  p.t += dt;
+  p.x += p.vx * dt; p.y += p.vy * dt;
+  if (tileAt(Math.floor(p.x), Math.floor(p.y))) { p.remove = true; ents.push({ kind: 'fx', type: 'explode', x: p.x - p.vx * dt, y: p.y - p.vy * dt, t: 0.15, life: 0.4, z: 0.1, scale: 0.5 }); return; }
+  if (Math.hypot(p.x - player.x, p.y - player.y) < 0.4) { p.remove = true; damagePlayer(randInt(p.dmg[0], p.dmg[1]), p.x, p.y); return; }
+  for (const e of ents) {
+    if (e.kind === 'monster' && e !== p.owner && e.state !== 'dead' && Math.hypot(e.x - p.x, e.y - p.y) < 0.4) { p.remove = true; hitEntity(e, randInt(p.dmg[0], p.dmg[1])); return; }
+    if (e.kind === 'barrel' && e.boom < 0 && Math.hypot(e.x - p.x, e.y - p.y) < 0.4) { p.remove = true; e.boom = 0.05; return; }
+  }
+}
+
+// ---------- 渲染 ----------
+function render3D() {
+  const ca = Math.cos(player.a), sa = Math.sin(player.a);
+  cam = { dx: ca, dy: sa, px: -sa * 0.66, py: ca * 0.66 };
+  const { dx, dy, px, py } = cam;
+  // 地板與天花板
+  const rdx0 = dx - px, rdy0 = dy - py, rdx1 = dx + px, rdy1 = dy + py;
+  const FT = TEX.floor, CT = TEX.ceil;
+  for (let y = HALF; y < VH; y++) {
+    const rowDist = HALF / (y - HALF + 0.5);
+    const stepX = rowDist * (rdx1 - rdx0) / W, stepY = rowDist * (rdy1 - rdy0) / W;
+    let fx = player.x + rowDist * rdx0, fy = player.y + rowDist * rdy0;
+    const f = fog(rowDist), fc = f * 0.85;
+    const fo = y * W, co = (VH - 1 - y) * W;
+    for (let x = 0; x < W; x++) {
+      const t = (((fy * TS) & 63) << 6) | ((fx * TS) & 63);
+      fx += stepX; fy += stepY;
+      pix[fo + x] = shade(FT[t], f);
+      pix[co + x] = shade(CT[t], fc);
+    }
+  }
+  // 牆壁 (DDA)
+  for (let x = 0; x < W; x++) {
+    const camX = 2 * x / W - 1;
+    const rx = dx + px * camX, ry = dy + py * camX;
+    let mapX = Math.floor(player.x), mapY = Math.floor(player.y);
+    const ddx = Math.abs(1 / rx), ddy = Math.abs(1 / ry);
+    let stepX, stepY, sdx, sdy;
+    if (rx < 0) { stepX = -1; sdx = (player.x - mapX) * ddx; } else { stepX = 1; sdx = (mapX + 1 - player.x) * ddx; }
+    if (ry < 0) { stepY = -1; sdy = (player.y - mapY) * ddy; } else { stepY = 1; sdy = (mapY + 1 - player.y) * ddy; }
+    let side = 0, tile = 0, perp = 30, wallX = 0, guard = 0;
+    while (guard++ < 80) {
+      if (sdx < sdy) { sdx += ddx; mapX += stepX; side = 0; } else { sdy += ddy; mapY += stepY; side = 1; }
+      tile = tileAt(mapX, mapY);
+      if (tile) {
+        perp = side === 0 ? sdx - ddx : sdy - ddy;
+        wallX = side === 0 ? player.y + perp * ry : player.x + perp * rx;
+        wallX -= Math.floor(wallX);
+        if (tile === DOOR) {
+          const open = doors.get(mapY * MW + mapX) || 0;
+          if (wallX < open) continue;
+          wallX -= open;
+        } else if ((side === 0 && rx > 0) || (side === 1 && ry < 0)) wallX = 1 - wallX;
+        break;
+      }
+    }
+    zbuf[x] = perp;
+    const tex = TEX[tile] || TEX[1];
+    const lineH = VH / perp;
+    let y0 = Math.floor(HALF - lineH / 2), y1 = Math.floor(HALF + lineH / 2);
+    const texX = Math.min(63, Math.floor(wallX * TS));
+    const step = TS / lineH;
+    let texPos = (Math.max(0, y0) - HALF + lineH / 2) * step;
+    if (y0 < 0) y0 = 0; if (y1 > VH) y1 = VH;
+    const f = fog(perp) * (side ? 0.78 : 1);
+    for (let y = y0; y < y1; y++) {
+      pix[y * W + x] = shade(tex[((texPos & 63) << 6) | texX], f);
+      texPos += step;
+    }
+  }
+  // 精靈
+  const list = [];
+  for (const e of ents) {
+    const p = project(e);
+    if (p.ty > 0.15) list.push({ e, p });
+  }
+  list.sort((a, b) => b.p.ty - a.p.ty);
+  for (const { e, p } of list) drawSprite(e, p);
+}
+function spriteFor(e) {
+  switch (e.kind) {
+    case 'monster': {
+      const f = e.state === 'dead' ? 4 : e.state === 'pain' ? 3 : e.state === 'attack' ? 2 : e.state === 'idle' ? 0 : Math.floor(e.anim) % 2;
+      return SPR[e.type][f];
+    }
+    case 'pickup': return SPR[e.type];
+    case 'barrel': return SPR.barrel;
+    case 'proj': return SPR[e.type][Math.floor(e.t * 10) % 2];
+    case 'fx': {
+      const frames = SPR[e.type];
+      return frames[Math.min(frames.length - 1, Math.floor(e.t / e.life * frames.length))];
+    }
+  }
+}
+function drawSprite(e, p) {
+  const tex = spriteFor(e);
+  const unit = VH / p.ty;
+  const scale = e.scale || (e.def ? e.def.scale : 1);
+  const size = unit * scale;
+  const bottom = HALF + unit / 2 - (e.z || 0) * unit;
+  const top = bottom - size, left = p.screenX - size / 2;
+  const x0 = Math.max(0, Math.floor(left)), x1 = Math.min(W, Math.floor(left + size));
+  const y0 = Math.max(0, Math.floor(top)), y1 = Math.min(VH, Math.floor(bottom));
+  const bright = e.kind === 'proj' || e.type === 'explode' ? 1 : fog(p.ty);
+  for (let x = x0; x < x1; x++) {
+    if (p.ty >= zbuf[x]) continue;
+    const tx = Math.floor((x - left) * TS / size);
+    for (let y = y0; y < y1; y++) {
+      const ty = Math.floor((y - top) * TS / size);
+      const c = tex[(ty << 6) | tx];
+      if ((c >>> 24) > 128) pix[y * W + x] = shade(c, bright);
+    }
+  }
+}
+function drawWeapon(g) {
+  const bx = 160 + Math.cos(bobT * 0.5) * 7 * moveAmt;
+  const by = 200 + Math.abs(Math.sin(bobT * 0.5)) * 7 * moveAmt + weaponKick * 10;
+  const lit = clamp(fog(0) + muzzle * 4, 0, 1);
+  g.save();
+  if (muzzle > 0) {
+    const fy = player.cur === 2 ? by - 100 : player.cur === 3 ? by - 88 : by - 84;
+    g.fillStyle = '#ffb000'; star(g, bx, fy, 20, 9, 8);
+    g.fillStyle = '#fff6c0'; star(g, bx, fy, 10, 5, 8);
+  }
+  if (player.cur === 1) {
+    g.fillStyle = '#c98d5a'; g.fillRect(bx - 14, by - 34, 28, 34);
+    g.fillStyle = '#a06a3e'; g.fillRect(bx - 14, by - 34, 6, 34);
+    g.fillStyle = '#4a4a4f'; g.fillRect(bx - 7, by - 72, 14, 42);
+    g.fillStyle = '#2a2a2e'; g.fillRect(bx - 5, by - 80, 10, 10);
+    g.fillStyle = '#86868c'; g.fillRect(bx - 6, by - 70, 2, 36);
+    g.fillStyle = '#c98d5a'; g.fillRect(bx - 16, by - 40, 10, 14); g.fillRect(bx + 6, by - 42, 10, 16);
+  } else if (player.cur === 2) {
+    g.fillStyle = '#2a2a2e'; g.fillRect(bx - 8, by - 98, 16, 80);
+    g.fillStyle = '#56565c'; g.fillRect(bx - 6, by - 98, 3, 78);
+    g.fillStyle = '#111'; g.fillRect(bx - 5, by - 100, 4, 4); g.fillRect(bx + 1, by - 100, 4, 4);
+    g.fillStyle = '#7a4a22'; g.fillRect(bx - 14, by - 58 + weaponKick * 8, 28, 18);
+    g.fillStyle = '#5a3416'; for (let i = 0; i < 4; i++) g.fillRect(bx - 14, by - 54 + i * 4 + weaponKick * 8, 28, 1);
+    g.fillStyle = '#c98d5a'; g.fillRect(bx - 22, by - 54 + weaponKick * 8, 12, 16); g.fillRect(bx + 10, by - 28, 14, 28);
+    g.fillStyle = '#7a4a22'; g.fillRect(bx - 12, by - 20, 24, 20);
+  } else {
+    const spin = (performance.now() / (firing ? 30 : 200)) | 0;
+    g.fillStyle = '#3a3a40'; g.fillRect(bx - 22, by - 60, 44, 60);
+    g.fillStyle = '#5a5a62'; g.fillRect(bx - 22, by - 60, 44, 4);
+    for (let i = 0; i < 4; i++) { g.fillStyle = (i + spin) % 2 ? '#222' : '#6a6a72'; g.fillRect(bx - 12 + i * 6, by - 90, 4, 32); }
+    g.fillStyle = '#888'; g.fillRect(bx - 14, by - 66, 28, 4);
+    g.fillStyle = '#c98d5a'; g.fillRect(bx - 30, by - 30, 12, 30); g.fillRect(bx + 18, by - 26, 12, 26);
+  }
+  if (lit < 1) { g.globalCompositeOperation = 'source-atop'; g.fillStyle = `rgba(0,0,0,${(1 - lit) * 0.6})`; g.fillRect(bx - 40, by - 110, 80, 110); }
+  g.restore();
+}
+function star(g, x, y, r1, r2, n) {
+  g.beginPath();
+  for (let i = 0; i < n * 2; i++) { const r = i & 1 ? r2 : r1, a = i * Math.PI / n; g.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r); }
+  g.closePath(); g.fill();
+}
+
+// HUD (以 buffer 座標繪製於高解析螢幕上,文字清晰)
+const RED = '#e2231a';
+function bigNum(g, txt, x, y, color = RED) {
+  g.font = 'bold 17px Impact, "Arial Black", sans-serif'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+  g.fillStyle = '#000'; g.fillText(txt, x + 1, y + 1);
+  g.fillStyle = color; g.fillText(txt, x, y);
+}
+function label(g, txt, x, y, color = '#d8ccb4', size = 6.5, align = 'center') {
+  g.font = `bold ${size}px "Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif`; g.textAlign = align; g.textBaseline = 'alphabetic';
+  g.fillStyle = '#000'; g.fillText(txt, x + 0.5, y + 0.5);
+  g.fillStyle = color; g.fillText(txt, x, y);
+}
+function panel(g, x, w) {
+  g.fillStyle = '#3c3a35'; g.fillRect(x, VH, w, 40);
+  g.fillStyle = '#56534b'; g.fillRect(x, VH, w, 1); g.fillRect(x, VH, 1, 40);
+  g.fillStyle = '#1e1d1a'; g.fillRect(x + w - 1, VH, 1, 40); g.fillRect(x, H - 1, w, 1);
+}
+function drawStatus(g) {
+  panel(g, 0, 50); panel(g, 50, 60); panel(g, 110, 40); panel(g, 150, 30); panel(g, 180, 56); panel(g, 236, 84);
+  const w = WEAPONS[player.cur];
+  bigNum(g, String(player.ammo[w.ammo]), 25, 225); label(g, '彈藥', 25, 236);
+  bigNum(g, player.health + '%', 80, 225); label(g, '生命', 80, 236);
+  for (let i = 1; i <= 3; i++) {
+    g.font = 'bold 10px monospace'; g.textAlign = 'center';
+    g.fillStyle = player.cur === i ? '#fff' : player.weapons[i] ? '#e8b422' : '#5a574f';
+    g.fillText(String(i), 118 + (i - 1) * 12, 220);
+  }
+  label(g, w.name, 130, 236);
+  drawFace(g, 165, 220);
+  bigNum(g, player.armor + '%', 208, 225); label(g, '護甲', 208, 236);
+  label(g, `子彈  ${player.ammo.bullets} / ${MAXAMMO.bullets}`, 242, 210, '#e8b422', 6.5, 'left');
+  label(g, `霰彈  ${player.ammo.shells} / ${MAXAMMO.shells}`, 242, 220, '#e8b422', 6.5, 'left');
+  label(g, `擊殺  ${player.kills} / ${totalMonsters}`, 242, 230, '#e8b422', 6.5, 'left');
+  const t = Math.floor(levelTime);
+  label(g, `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`, 314, 237, '#8d8778', 5.5, 'right');
+}
+function drawFace(g, cx, cy) {
+  const hp = player.health, tier = hp > 80 ? 0 : hp > 60 ? 1 : hp > 40 ? 2 : hp > 20 ? 3 : 4;
+  if (Math.random() < 0.01) faceLook = randInt(-1, 1);
+  g.save();
+  g.fillStyle = player.dead ? '#8a6a5a' : '#d39a6a';
+  g.beginPath(); g.ellipse(cx, cy, 10, 13, 0, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#5a3a1a'; g.fillRect(cx - 10, cy - 13, 20, 5);
+  if (player.dead) {
+    g.strokeStyle = '#300'; g.lineWidth = 1.2;
+    for (const ex of [-4, 4]) { g.beginPath(); g.moveTo(cx + ex - 2, cy - 4); g.lineTo(cx + ex + 2, cy); g.moveTo(cx + ex + 2, cy - 4); g.lineTo(cx + ex - 2, cy); g.stroke(); }
+    g.fillStyle = '#300'; g.fillRect(cx - 4, cy + 5, 8, 2);
+  } else {
+    const look = faceLook * 1.5;
+    g.fillStyle = '#fff'; g.fillRect(cx - 6, cy - 4, 4, 3); g.fillRect(cx + 2, cy - 4, 4, 3);
+    g.fillStyle = '#1a4a9a'; g.fillRect(cx - 5 + look, cy - 4, 2, 3); g.fillRect(cx + 3 + look, cy - 4, 2, 3);
+    g.fillStyle = '#4a2a0a';
+    if (faceTimer > 0) { g.fillRect(cx - 7, cy - 7, 5, 1.5); g.fillRect(cx + 2, cy - 7, 5, 1.5); }
+    if (grin > 0) { g.fillStyle = '#fff'; g.fillRect(cx - 5, cy + 4, 10, 3); g.strokeStyle = '#300'; g.lineWidth = 0.6; g.strokeRect(cx - 5, cy + 4, 10, 3); }
+    else if (faceTimer > 0) { g.fillStyle = '#300'; g.beginPath(); g.ellipse(cx, cy + 6, 3, 2.5, 0, 0, Math.PI * 2); g.fill(); }
+    else { g.fillStyle = '#6a2a1a'; g.fillRect(cx - 4, cy + 5, 8, 1.5); }
+  }
+  g.fillStyle = '#b00';
+  if (tier >= 1) g.fillRect(cx + 5, cy - 9, 2, 7);
+  if (tier >= 2) g.fillRect(cx - 8, cy + 1, 2, 6);
+  if (tier >= 3) { g.fillRect(cx - 1, cy - 12, 2, 6); g.fillRect(cx + 6, cy + 3, 2, 5); }
+  if (tier >= 4) { g.fillStyle = 'rgba(160,0,0,0.45)'; g.beginPath(); g.ellipse(cx, cy, 10, 13, 0, 0, Math.PI * 2); g.fill(); }
+  g.restore();
+}
+function drawMinimap(g) {
+  const s = Math.min(4, 120 / Math.max(MW, MH)), ox = W - MW * s - 6, oy = 6;
+  g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(ox - 2, oy - 2, MW * s + 4, MH * s + 4);
+  for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
+    const t = map[y * MW + x];
+    if (!t) continue;
+    g.fillStyle = t === DOOR ? '#e8b422' : t === EXIT ? '#3f3' : '#8a8578';
+    g.fillRect(ox + x * s, oy + y * s, s, s);
+  }
+  for (const e of ents) {
+    if (e.kind === 'monster' && e.state !== 'dead') { g.fillStyle = '#f33'; g.fillRect(ox + e.x * s - 1, oy + e.y * s - 1, 2, 2); }
+    else if (e.kind === 'pickup') { g.fillStyle = '#4af'; g.fillRect(ox + e.x * s - 0.75, oy + e.y * s - 0.75, 1.5, 1.5); }
+  }
+  g.fillStyle = '#fff'; g.beginPath(); g.arc(ox + player.x * s, oy + player.y * s, 1.6, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = '#fff'; g.lineWidth = 0.8; g.beginPath(); g.moveTo(ox + player.x * s, oy + player.y * s);
+  g.lineTo(ox + (player.x + Math.cos(player.a) * 1.6) * s, oy + (player.y + Math.sin(player.a) * 1.6) * s); g.stroke();
+}
+function centerText(g, txt, y, size, color, font = '"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif', weight = 900) {
+  g.font = `${weight} ${size}px ${font}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = '#000'; g.fillText(txt, W / 2 + size / 14 + 0.5, y + size / 14 + 0.5);
+  g.fillStyle = color; g.fillText(txt, W / 2, y);
+}
+function drawOverlay(g) {
+  const blink = Math.floor(performance.now() / 500) % 2 === 0;
+  const tap = isTouch ? '點擊畫面' : '點擊滑鼠或按 Enter';
+  if (state === 'play') return;
+  g.fillStyle = state === 'dead' ? 'rgba(90,0,0,0.55)' : 'rgba(0,0,0,0.62)';
+  g.fillRect(0, 0, W, VH);
+  if (state === 'title') {
+    const grad = g.createLinearGradient(0, 30, 0, 75);
+    grad.addColorStop(0, '#ffd23a'); grad.addColorStop(0.45, '#e2231a'); grad.addColorStop(1, '#5a0a06');
+    centerText(g, '毀滅戰士', 52, 42, grad);
+    centerText(g, 'D O O M  ·  J S', 82, 9, '#e8b422', 'Impact, "Arial Black", sans-serif', 400);
+    const lines = isTouch
+      ? ['左半邊拖曳:移動', '右半邊拖曳:轉向', '右下按鈕:開火 / 換槍', '走向門或出口即可開啟']
+      : ['W A S D / 方向鍵:移動      滑鼠:轉向', '左鍵 / 空白鍵 / Ctrl:開火', '1 2 3 或 Q:換武器      E:開門 / 使用', 'Shift:奔跑      M:地圖      Esc:暫停'];
+    lines.forEach((l, i) => centerText(g, l, 108 + i * 13, 8, '#f2e8d5', undefined, 700));
+    centerText(g, '三個關卡 · 擊敗地獄男爵', 166, 7.5, '#b9ad94', undefined, 700);
+    if (blink) centerText(g, tap + '開始', 186, 11, '#ffd23a');
+  } else if (state === 'paused') {
+    centerText(g, '已暫停', 80, 26, '#f2e8d5');
+    if (blink) centerText(g, tap + '繼續', 120, 10, '#ffd23a');
+  } else if (state === 'dead') {
+    centerText(g, '你陣亡了', 75, 32, '#ff3a2a');
+    centerText(g, `擊殺 ${player.kills} / ${totalMonsters}`, 108, 9, '#f2e8d5', undefined, 700);
+    if (blink) centerText(g, tap + '重新挑戰本關', 140, 10, '#ffd23a');
+  } else if (state === 'levelDone' || state === 'victory') {
+    const t = Math.floor(levelTime);
+    const pct = totalMonsters ? Math.round(player.kills / totalMonsters * 100) : 100;
+    centerText(g, LEVELS[levelIdx].name, 42, 13, '#e8b422', undefined, 800);
+    centerText(g, state === 'victory' ? '恭喜通關!' : '關卡完成', 72, 26, '#f2e8d5');
+    centerText(g, `擊殺 ${pct}%      時間 ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`, 104, 10, '#f2e8d5', undefined, 700);
+    if (state === 'victory') centerText(g, '你擊敗了地獄男爵,人類得救了。暫時。', 126, 8.5, '#b9ad94', undefined, 700);
+    if (blink) centerText(g, state === 'victory' ? tap + '回到標題' : tap + '進入下一關', 156, 10, '#ffd23a');
+  }
+}
+
+// ---------- 主迴圈 ----------
+let cw = 0, ch = 0, S = 1, ox = 0, oy = 0;
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  cw = canvas.width = Math.floor(innerWidth * dpr);
+  ch = canvas.height = Math.floor(innerHeight * dpr);
+  S = Math.min(cw / W, ch / H); ox = Math.floor((cw - W * S) / 2); oy = Math.floor((ch - H * S) / 2);
+}
+addEventListener('resize', resize); resize();
+
+function render() {
+  render3D();
+  bctx.putImageData(img, 0, 0);
+  if (state === 'play' || state === 'paused') drawWeapon(bctx);
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.fillStyle = '#000'; sctx.fillRect(0, 0, cw, ch);
+  sctx.imageSmoothingEnabled = false;
+  sctx.drawImage(buf, 0, 0, W, VH, ox, oy, W * S, VH * S);
+  sctx.setTransform(S, 0, 0, S, ox, oy);
+  // 受傷 / 撿取 閃光
+  if (flashRed > 0) { sctx.fillStyle = `rgba(255,0,0,${flashRed * 0.5})`; sctx.fillRect(0, 0, W, VH); }
+  if (flashGold > 0) { sctx.fillStyle = `rgba(255,220,80,${flashGold * 0.4})`; sctx.fillRect(0, 0, W, VH); }
+  if (state === 'play') {
+    sctx.fillStyle = 'rgba(255,255,255,0.7)';
+    sctx.fillRect(W / 2 - 4, HALF, 3, 0.7); sctx.fillRect(W / 2 + 1.5, HALF, 3, 0.7);
+    sctx.fillRect(W / 2 - 0.15, HALF - 3.6, 0.7, 3); sctx.fillRect(W / 2 - 0.15, HALF + 1.4, 0.7, 3);
+    messages.forEach((m, i) => label(sctx, m.text, 6, 12 + i * 10, '#f2e8d5', 7.5, 'left'));
+    if (showMap) drawMinimap(sctx);
+  }
+  drawStatus(sctx);
+  drawOverlay(sctx);
+}
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (state === 'play') update(dt);
+  else if (state === 'title') player.a += dt * 0.15;
+  render();
+  requestAnimationFrame(frame);
+}
+// 標題畫面背景使用第一關場景
+loadLevel(0); messages = [];
+requestAnimationFrame(frame);
+</script>
