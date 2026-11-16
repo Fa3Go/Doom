@@ -225,7 +225,7 @@ body.touch .bar { width: 120px; }
       <label for="sFov">視野 FOV<input id="sFov" type="range" min="65" max="105" step="1"><output id="oFov"></output></label>
       <label for="sVol">音效音量<input id="sVol" type="range" min="0" max="1" step="0.05"><output id="oVol"></output></label>
       <label for="sMus">音樂音量<input id="sMus" type="range" min="0" max="1" step="0.05"><output id="oMus"></output></label>
-      <label for="sQual">畫質<select id="sQual"><option value="high">高（光暈特效）</option><option value="low">低（較流暢）</option></select><span></span></label>
+      <label for="sQual">畫質<select id="sQual"><option value="high">高（光暈特效）</option><option value="low">低（最流暢，關閉光暈與表面凹凸）</option></select><span></span></label>
     </div>
     <div class="menu"><button class="primary" data-act="back" type="button">返回</button></div>
   </div>
@@ -416,14 +416,39 @@ function updatePointScale() {
   const h = renderer.getDrawingBufferSize(new THREE.Vector2()).y, k = h / (2 * Math.tan(camera.fov * Math.PI / 360));
   fxAdd.mat.uniforms.uScale.value = fxNorm.mat.uniforms.uScale.value = k;
 }
-function resize() {
-  const pr = Math.min(window.devicePixelRatio || 1, settings.quality === 'high' ? 1.5 : 1);
-  renderer.setPixelRatio(settings.quality === 'high' ? pr : Math.min(pr, 0.85));
+// 動態解析度:依實際幀率自動調整渲染倍率,畫面縮放交給瀏覽器
+const perf = { scale: 1, acc: 0, n: 0, t: 0, good: 0 };
+function maxScale() { return Math.min(window.devicePixelRatio || 1, settings.quality === 'high' ? 1.25 : 0.8); }
+function minScale() { return settings.quality === 'high' ? 0.5 : 0.4; }
+function applyScale() {
+  renderer.setPixelRatio(perf.scale);
   renderer.setSize(innerWidth, innerHeight, false);
+  if (composer) { composer.setPixelRatio(perf.scale); composer.setSize(innerWidth, innerHeight); }
+  updatePointScale();
+}
+function adaptResolution(dt) {
+  perf.acc += dt; perf.n++;
+  if (perf.acc < 1) return;
+  const avg = perf.acc / perf.n; perf.acc = perf.n = 0;
+  let s = perf.scale;
+  if (avg > 1 / 48) { s = Math.max(minScale(), s * (avg > 1 / 30 ? 0.75 : 0.88)); perf.good = -4; }
+  else if (avg < 1 / 57) { if (++perf.good >= 3) { s = Math.min(maxScale(), s * 1.1); perf.good = 0; } }
+  else perf.good = Math.min(perf.good, 0);
+  if (Math.abs(s - perf.scale) > 0.005) { perf.scale = s; applyScale(); }
+}
+function resize() {
   camera.aspect = wCam.aspect = innerWidth / innerHeight;
   camera.fov = settings.fov; camera.updateProjectionMatrix(); wCam.updateProjectionMatrix();
-  updatePointScale();
+  perf.scale = Math.min(perf.scale, maxScale());
+  applyScale();
+}
+function applyQuality() {
+  // 低畫質關掉法線貼圖;天花板很暗,法線貼圖幾乎看不出來,一律不用
+  for (const k in bakedMats) { const m = bakedMats[k]; m.normalMap = settings.quality === 'high' && k !== 'ceil' ? m.userData.nm : null; }
+  perf.scale = maxScale();
+  renderer.setPixelRatio(perf.scale); renderer.setSize(innerWidth, innerHeight, false);
   setupPost();
+  resize();
 }
 addEventListener('resize', resize);
 
@@ -587,7 +612,7 @@ const M = {};
 function stdMat(color, o = {}) { return new THREE.MeshStandardMaterial(Object.assign({ color, roughness: 0.7, metalness: 0.1 }, o)); }
 function glowMat(color, intensity = 2) { const m = new THREE.MeshBasicMaterial({ color }); m.color.multiplyScalar(intensity); m.toneMapped = false; return m; }
 
-let wallMats = {};
+let wallMats = {}, bakedMats = {};
 function buildWallMaterials() {
   const ns = new THREE.Vector2(1, 1);
   wallMats[1] = stdMat(0xffffff, { map: SURF[1].map, normalMap: SURF[1].normalMap, normalScale: ns, roughness: 0.85 });
@@ -598,6 +623,8 @@ function buildWallMaterials() {
   wallMats[6] = stdMat(0xffffff, { map: SURF[6].map, normalMap: SURF[6].normalMap, emissiveMap: SURF[6].emissiveMap, emissive: 0xffffff, emissiveIntensity: 0.4, roughness: 0.55, metalness: 0.0 });
   M.floor = stdMat(0xffffff, { map: SURF.floor.map, normalMap: SURF.floor.normalMap, roughness: 0.6, metalness: 0.45 });
   M.ceil = stdMat(0xffffff, { map: SURF.ceil.map, normalMap: SURF.ceil.normalMap, roughness: 0.9 });
+  bakedMats = { floor: bakedMat(M.floor), ceil: bakedMat(M.ceil) };
+  for (const t of [1, 2, 3, 5, 6]) bakedMats[t] = bakedMat(wallMats[t]);
   M.decal = new THREE.MeshBasicMaterial({ map: decalTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4 });
   M.blood = new THREE.MeshStandardMaterial({ map: bloodTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, roughness: 0.3 });
 }
@@ -739,6 +766,7 @@ class Particles {
     scene.add(this.pts);
   }
   emit(x, y, z, count, o) {
+    this.active = true;
     for (let k = 0; k < count; k++) {
       const i = this.i; this.i = (this.i + 1) % this.n;
       const sp = (o.speed || 3) * (0.3 + rand() * 0.7);
@@ -756,6 +784,8 @@ class Particles {
     }
   }
   update(dt) {
+    if (!this.active) return;
+    let alive = 0;
     for (let i = 0; i < this.n; i++) {
       if (this.life[i] <= 0) { if (this.size[i] !== 0) this.size[i] = 0; continue; }
       this.life[i] -= dt;
@@ -764,11 +794,13 @@ class Particles {
       this.pos[p] += this.vel[p] * dt; this.pos[p + 1] += this.vel[p + 1] * dt; this.pos[p + 2] += this.vel[p + 2] * dt;
       if (this.pos[p + 1] < 0.02) { this.pos[p + 1] = 0.02; this.vel[p + 1] *= -0.25; this.vel[p] *= 0.5; this.vel[p + 2] *= 0.5; }
       this.col[i * 4 + 3] = this.base[i] * Math.min(1, this.life[i] / this.max[i] * 1.5);
+      alive++;
     }
+    if (!alive) this.active = false;
     const a = this.pts.geometry.attributes;
     a.position.needsUpdate = a.pcolor.needsUpdate = a.size.needsUpdate = true;
   }
-  clear() { this.life.fill(0); this.size.fill(0); }
+  clear() { this.life.fill(0); this.size.fill(0); this.pts.geometry.attributes.size.needsUpdate = true; this.active = false; }
 }
 let fxAdd, fxNorm;
 
@@ -841,8 +873,7 @@ function buildMonster(type) {
     part(G.box, dark, 0.5, 0.1, 0.38, 0, -0.06, 0.12, P.jaw);
     for (let k = 0; k < 6; k++) part(G.cone, tooth, 0.03, 0.09, 0.03, -0.2 + k * 0.08, 0.03, 0.3, P.jaw);
   }
-  root.traverse(o => { if (o.isMesh) o.castShadow = false; });
-  return { root, body, P, mats };
+  return { root, body, P, mats, base: mats.map(m => m.color.clone()) };
 }
 
 // 第一人稱武器模型
@@ -952,7 +983,7 @@ let state = 'loading'; // loading | title | play | paused | settings | dead | do
 let prevState = 'title';
 let levelIdx = 0, map, MW, MH, doors, ents, player = null, levelTime = 0, totalMonsters = 0, bossAlive = false, boss = null;
 let carry = null;
-let levelGroup = null, lightCands = [], roomLights = [], dynLights = [], decals = [], bloods = [], decalI = 0, bloodI = 0, fixtureMesh = null;
+let levelGroup = null, lightCands = [], dynLights = [], decals = [], bloods = [], decalI = 0, bloodI = 0, fixtureMesh = null;
 let shake = 0, hurtFx = 0, pickFx = 0, recoil = 0, swayX = 0, swayY = 0, bobT = 0, moveAmt = 0, switchT = 0, crossBloom = 0, lunge = null;
 let showMap = true, time = 0;
 
@@ -969,7 +1000,6 @@ function lineOfSight(x0, z0, x1, z1) {
 
 function clearLevel() {
   if (levelGroup) { scene.remove(levelGroup); levelGroup.traverse(o => { if (o.geometry && !Object.values(G).includes(o.geometry)) o.geometry.dispose(); }); }
-  for (const l of roomLights) l.intensity = 0;
   if (fxAdd) { fxAdd.clear(); fxNorm.clear(); }
 }
 function loadLevel(i) {
@@ -985,35 +1015,25 @@ function loadLevel(i) {
   totalMonsters = 0; bossAlive = false; boss = null;
   const mtype = { z: 'zombie', i: 'imp', d: 'demon', B: 'baron' };
   const ptype = { h: 'health', a: 'bullets', s: 'shells', e: 'cells', g: 'shotgun', c: 'chaingun', p: 'plasma', r: 'armor' };
-  const counts = {};
-  for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) { const t = WALLCHAR[L.map[y][x]]; if (t && t !== DOOR) counts[t] = (counts[t] || 0) + 1; }
-  const inst = {}, idx = {};
-  for (const t in counts) { inst[t] = new THREE.InstancedMesh(G.wall, wallMats[t], counts[t]); idx[t] = 0; levelGroup.add(inst[t]); }
   const mtx = new THREE.Matrix4();
+  for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) map[y * MW + x] = WALLCHAR[L.map[y][x]] || 0;
   for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
     const ch = L.map[y][x], t = WALLCHAR[ch];
     const cx = (x + 0.5) * T, cz = (y + 0.5) * T;
     if (t) {
-      map[y * MW + x] = t;
       if (t === DOOR) {
         const dm = new THREE.Mesh(G.wall, wallMats[4]); dm.scale.set(1, 1, 1); dm.position.set(cx, WH / 2, cz);
         // 門的厚度依照通道方向縮薄
         const horiz = WALLCHAR[L.map[y][x - 1]] && WALLCHAR[L.map[y][x + 1]];
         if (horiz) dm.scale.z = 0.35; else dm.scale.x = 0.35;
         levelGroup.add(dm); doors.set(y * MW + x, { open: 0, opening: false, mesh: dm });
-      } else { mtx.makeTranslation(cx, WH / 2, cz); inst[t].setMatrixAt(idx[t]++, mtx); }
+      }
     }
     if (ch === 'P') { player.x = cx; player.z = cz; player.yaw = facingOpen(x, y, L.map); }
     else if (mtype[ch]) addMonster(mtype[ch], cx, cz);
     else if (ptype[ch]) addPickup(ptype[ch], cx, cz);
     else if (ch === 'b') { const m = buildBarrel(); m.position.set(cx, 0, cz); levelGroup.add(m); ents.push({ kind: 'barrel', x: cx, z: cz, hp: 20, boom: -1, r: 0.42, h: 1.05, mesh: m }); }
   }
-  // 地板與天花板
-  const fg = new THREE.PlaneGeometry(MW * T, MH * T); fg.rotateX(-Math.PI / 2);
-  for (const k of ['map', 'normalMap']) { M.floor[k].repeat.set(MW, MH); M.ceil[k].repeat.set(MW * 2, MH * 2); }
-  const floor = new THREE.Mesh(fg, M.floor); floor.position.set(MW * T / 2, 0, MH * T / 2); levelGroup.add(floor);
-  const cg = new THREE.PlaneGeometry(MW * T, MH * T); cg.rotateX(Math.PI / 2);
-  const ceil = new THREE.Mesh(cg, M.ceil); ceil.position.set(MW * T / 2, WH, MH * T / 2); levelGroup.add(ceil);
   // 燈光候選點
   const pal = [[[0.75, 0.9, 1.0], [1.0, 0.85, 0.6], [0.6, 0.85, 1.0]], [[1.0, 0.55, 0.25], [1.0, 0.75, 0.4], [1.0, 0.35, 0.2]], [[1.0, 0.3, 0.15], [1.0, 0.5, 0.2], [0.9, 0.2, 0.25]]][L.theme];
   lightCands = [];
@@ -1029,6 +1049,8 @@ function loadLevel(i) {
   fixtureMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.9, 0.06, 0.9), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }), lightCands.length);
   lightCands.forEach((c, k) => { mtx.makeTranslation(c.x, WH - 0.03, c.z); fixtureMesh.setMatrixAt(k, mtx); fixtureMesh.setColorAt(k, c.color.clone().multiplyScalar(3)); c.idx = k; });
   levelGroup.add(fixtureMesh);
+  buildStaticGeometry();
+  for (const e of ents) if (e.kind === 'monster') tintMonster(e);
   scene.fog = new THREE.FogExp2([0x0a0c10, 0x140806, 0x160404][L.theme], 0.028);
   scene.background = scene.fog.color;
   // 貼花池
@@ -1043,6 +1065,7 @@ function loadLevel(i) {
   if (L.boss) feed('擊敗地獄男爵，出口才會開啟');
   showWeapon();
   updateHUD(true);
+  updateVisibility(0, true);
 }
 function facingOpen(x, y, m) {
   for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1]]) if (m[y + dy][x + dx] === '.') return Math.atan2(-dx, -dy);
@@ -1051,7 +1074,7 @@ function facingOpen(x, y, m) {
 function addMonster(type, x, z) {
   const d = MDEF[type], mdl = buildMonster(type);
   mdl.root.position.set(x, 0, z); levelGroup.add(mdl.root);
-  const e = { kind: 'monster', type, def: d, x, z, hp: d.hp, state: 'idle', timer: 0, cool: rand() * d.cool, anim: rand() * 6, fired: false, side: 0, sideT: 0,
+  const e = { tintT: rand() * 0.3, kind: 'monster', type, def: d, x, z, hp: d.hp, state: 'idle', timer: 0, cool: rand() * d.cool, anim: rand() * 6, fired: false, side: 0, sideT: 0,
     r: d.r, h: d.h, mdl, flash: 0, deadT: 0, stagger: 0, face: rand() * 6 };
   ents.push(e); totalMonsters++;
   if (d.boss) { bossAlive = true; boss = e; }
@@ -1062,34 +1085,122 @@ function addPickup(type, x, z, extra = {}) {
   ents.push(e); return e;
 }
 
+// ---------- 烘焙光照的靜態幾何 ----------
+// 房間燈光在載入關卡時一次算好,存進頂點顏色,執行時只剩少數動態光源。
+const BAKE_R = 15;
+function losBake(x0, z0, x1, z1) {
+  const sx = Math.floor(x0 / T), sz = Math.floor(z0 / T);
+  const dx = x1 - x0, dz = z1 - z0, steps = Math.ceil(Math.hypot(dx, dz) * 5);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps, tx = Math.floor((x0 + dx * t) / T), tz = Math.floor((z0 + dz * t) / T);
+    if ((tx !== sx || tz !== sz) && tileAt(tx, tz)) return false;
+  }
+  return true;
+}
+function bakeAt(x, y, z, nx, ny, nz, out) {
+  let r = 0.02, g = 0.02, b = 0.025;
+  for (const c of lightCands) {
+    const dx = c.x - x, dy = WH - 0.35 - y, dz = c.z - z, d = Math.hypot(dx, dy, dz);
+    if (d >= BAKE_R || !losBake(x, z, c.x, c.z)) continue;
+    const a = Math.pow(1 - d / BAKE_R, 1.6) * (Math.max(0, (dx * nx + dy * ny + dz * nz) / d) * 1.7 + 0.2);
+    r += c.color.r * a; g += c.color.g * a; b += c.color.b * a;
+  }
+  out[0] = r; out[1] = g; out[2] = b; return out;
+}
+class GeoBuilder {
+  constructor() { this.pos = []; this.nrm = []; this.uv = []; this.col = []; this.idx = []; }
+  // 以 (ox,oy,oz) 為角、u/v 為邊方向的細分四邊形;u×v 必須等於法線
+  quad(ox, oy, oz, u, v, n, uLen, vLen, nu, nv, uvU, uvV) {
+    const base = this.pos.length / 3, c = [0, 0, 0];
+    const cx = ox + (u[0] * uLen + v[0] * vLen) / 2, cy = oy + (u[1] * uLen + v[1] * vLen) / 2, cz = oz + (u[2] * uLen + v[2] * vLen) / 2;
+    for (let j = 0; j <= nv; j++) for (let i = 0; i <= nu; i++) {
+      const a = uLen * i / nu, bb = vLen * j / nv;
+      const px = ox + u[0] * a + v[0] * bb, py = oy + u[1] * a + v[1] * bb, pz = oz + u[2] * a + v[2] * bb;
+      this.pos.push(px, py, pz); this.nrm.push(n[0], n[1], n[2]); this.uv.push(uvU * i / nu, uvV * j / nv);
+      bakeAt(px + n[0] * 0.08 + (cx - px) * 0.04, py + n[1] * 0.08 + (cy - py) * 0.04, pz + n[2] * 0.08 + (cz - pz) * 0.04, n[0], n[1], n[2], c);
+      this.col.push(c[0], c[1], c[2]);
+    }
+    for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++) {
+      const a = base + j * (nu + 1) + i, b = a + 1, d = a + nu + 1, e = d + 1;
+      this.idx.push(a, b, e, a, e, d);
+    }
+  }
+  mesh(mat) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nrm, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
+    g.setIndex(this.idx); g.computeBoundingSphere();
+    return new THREE.Mesh(g, mat);
+  }
+}
+const UP = [0, 1, 0];
+function buildStaticGeometry() {
+  const walls = {}, floor = new GeoBuilder(), ceil = new GeoBuilder();
+  for (let z = 0; z < MH; z++) for (let x = 0; x < MW; x++) {
+    const t = map[z * MW + x];
+    if (!t || t === DOOR) {
+      floor.quad(x * T, 0, (z + 1) * T, [1, 0, 0], [0, 0, -1], UP, T, T, 2, 2, 1, 1);
+      ceil.quad(x * T, WH, z * T, [1, 0, 0], [0, 0, 1], [0, -1, 0], T, T, 2, 2, 2, 2);
+      continue;
+    }
+    for (const [nx, nz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const ax = x + nx, az = z + nz;
+      if (ax < 0 || az < 0 || ax >= MW || az >= MH) continue;
+      const nt = map[az * MW + ax];
+      if (nt && nt !== DOOR) continue; // 兩面都是牆,看不到
+      const u = [nz, 0, -nx];
+      const fx = (x + 0.5) * T + nx * T / 2 - u[0] * T / 2, fz = (z + 0.5) * T + nz * T / 2 - u[2] * T / 2;
+      (walls[t] = walls[t] || new GeoBuilder()).quad(fx, 0, fz, u, UP, [nx, 0, nz], T, WH, 3, 4, 1, WH / T);
+    }
+  }
+  for (const t in walls) levelGroup.add(walls[t].mesh(bakedMats[t]));
+  levelGroup.add(floor.mesh(bakedMats.floor));
+  levelGroup.add(ceil.mesh(bakedMats.ceil));
+}
+function bakedMat(src) {
+  const m = src.clone();
+  m.vertexColors = true;
+  m.userData.nm = src.normalMap;
+  m.onBeforeCompile = sh => {
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <color_fragment>', '')
+      .replace('#include <lights_fragment_maps>', '#include <lights_fragment_maps>\n#if defined( RE_IndirectDiffuse )\nirradiance += vColor * PI;\n#endif');
+  };
+  m.customProgramCacheKey = () => 'baked';
+  return m;
+}
+// 怪物依所在位置的烘焙光調整顏色,避免在昏暗房間裡過亮
+const _tint = [0, 0, 0];
+function tintMonster(e) {
+  bakeAt(e.x, 1.2, e.z, 0, 1, 0, _tint);
+  const k = [0.45 + _tint[0] * 0.75, 0.45 + _tint[1] * 0.75, 0.45 + _tint[2] * 0.75].map(v => Math.min(1.6, v));
+  e.mdl.mats.forEach((m, i) => { const b = e.mdl.base[i]; m.color.setRGB(b.r * k[0], b.g * k[1], b.b * k[2]); });
+}
+
 // ---------- 燈光 ----------
 function buildLights() {
   scene.add(new THREE.HemisphereLight(0x6a7488, 0x2a2018, 0.55));
   scene.add(new THREE.AmbientLight(0x404040, 0.35));
-  for (let k = 0; k < 8; k++) { const l = new THREE.PointLight(0xffffff, 0, 15, 1.6); scene.add(l); roomLights.push(l); }
-  for (let k = 0; k < 4; k++) { const l = new THREE.PointLight(0xffaa55, 0, 10, 2); scene.add(l); dynLights.push({ l, t: 0, life: 1, base: 0 }); }
+  for (let k = 0; k < 3; k++) { const l = new THREE.PointLight(0xffaa55, 0, 10, 2); scene.add(l); dynLights.push({ l, t: 0, life: 1, base: 0 }); }
 }
 function flashLight(x, y, z, color, intensity, life, dist = 10) {
   let best = dynLights[0]; for (const d of dynLights) if (d.t < best.t) best = d;
   best.l.position.set(x, y, z); best.l.color.setHex(color); best.l.distance = dist; best.base = intensity; best.t = best.life = life;
 }
-let lightTimer = 0;
 function updateLights(dt) {
   for (const d of dynLights) { d.t = Math.max(0, d.t - dt); d.l.intensity = d.base * (d.t / d.life); }
-  lightTimer -= dt;
-  if (lightTimer <= 0) {
-    lightTimer = 0.15;
-    const px = player.x, pz = player.z;
-    const sorted = lightCands.slice().sort((a, b) => ((a.x - px) ** 2 + (a.z - pz) ** 2) - ((b.x - px) ** 2 + (b.z - pz) ** 2));
-    roomLights.forEach((l, k) => { const c = sorted[k]; l.userData.c = c; if (c) { l.position.set(c.x, WH - 0.35, c.z); l.color.copy(c.color); } });
+  // 燈具閃爍(只改燈具本身的亮度)
+  let dirty = false;
+  for (const c of lightCands) {
+    if (!c.flicker) continue;
+    const on = Math.sin(time * 23 + c.phase) + Math.sin(time * 7.3 + c.phase * 2) <= 1.3;
+    if (on !== c.on) { c.on = on; _col.copy(c.color).multiplyScalar(on ? 3 : 0.3); fixtureMesh.setColorAt(c.idx, _col); dirty = true; }
   }
-  for (const l of roomLights) {
-    const c = l.userData.c; if (!c) { l.intensity = 0; continue; }
-    let k = 1.7;
-    if (c.flicker) { const f = Math.sin(time * 23 + c.phase) + Math.sin(time * 7.3 + c.phase * 2); k *= f > 1.3 ? 0.15 : 1; fixtureMesh.setColorAt(c.idx, c.color.clone().multiplyScalar(f > 1.3 ? 0.3 : 3)); fixtureMesh.instanceColor.needsUpdate = true; }
-    l.intensity = k;
-  }
+  if (dirty) fixtureMesh.instanceColor.needsUpdate = true;
 }
+const _col = new THREE.Color();
 
 // ---------- 貼花 ----------
 function addDecal(x, y, z, nx, ny, nz) {
@@ -1244,7 +1355,7 @@ function syncSettingsUI() {
 for (const [id, key] of [['sSens', 'sens'], ['sFov', 'fov'], ['sVol', 'vol'], ['sMus', 'music']]) {
   $(id).addEventListener('input', e => { settings[key] = +e.target.value; syncSettingsUI(); applyVolume(); if (key === 'fov') { camera.fov = settings.fov; camera.updateProjectionMatrix(); updatePointScale(); } saveSettings(); });
 }
-$('sQual').addEventListener('change', e => { settings.quality = e.target.value; saveSettings(); resize(); });
+$('sQual').addEventListener('change', e => { settings.quality = e.target.value; saveSettings(); applyQuality(); });
 
 // ============================================================
 //  玩家動作
@@ -1424,7 +1535,7 @@ function killMonster(e, glory) {
   if (glory) {
     fxNorm.emit(e.x, e.h * 0.6, e.z, 90, { speed: 7, color: [0.5, 0, 0], size: 0.12, life: 1.1, grav: 11, jitter: 0.5, up: 2 });
     fxAdd.emit(e.x, e.h * 0.6, e.z, 25, { speed: 5, color: [3, 0.6, 0.1], size: 0.08, life: 0.4, grav: 6 });
-    e.mdl.root.visible = false;
+    e.mdl.root.visible = false; e.gibbed = true;
     const n = randInt(4, 6);
     for (let k = 0; k < n; k++) addPickup('orb', e.x, e.z, { y: 1, vx: (rand() - 0.5) * 6, vz: (rand() - 0.5) * 6, vy: 3 + rand() * 3, orb: true, life: 15 });
     if (rand() < 0.6) { const w = WEAPONS[player.cur]; if (w.ammo) addPickup(w.ammo, e.x + 0.3, e.z, { small: true }); }
@@ -1566,7 +1677,7 @@ function update(dt) {
   let canGlory = false;
   const [fx, fz] = fwdVec();
   for (const e of ents) if (e.kind === 'monster' && e.state === 'stagger') { const dx = e.x - player.x, dz = e.z - player.z, d = Math.hypot(dx, dz); if (d < 3.2 + e.r && (dx * fx + dz * fz) / d > 0.55) canGlory = true; }
-  $('prompt').hidden = !canGlory;
+  if (hudCache.glory !== canGlory) { hudCache.glory = canGlory; $('prompt').hidden = !canGlory; }
   updateHUD();
 }
 function updatePickup(e, dt) {
@@ -1607,7 +1718,7 @@ function tryPickup(e) {
 }
 function updateMonster(m, dt) {
   const d = m.def;
-  if (m.state === 'dead') { m.deadT += dt; return; }
+  if (m.state === 'dead') { m.deadT += dt; if (m.deadT > 10 && !m.remove) { m.remove = true; levelGroup.remove(m.mdl.root); } return; }
   const dx = player.x - m.x, dz = player.z - m.z, dist = Math.hypot(dx, dz);
   const sees = dist < 46 && lineOfSight(m.x, m.z, player.x, player.z);
   m.flash = Math.max(0, m.flash - dt);
@@ -1744,12 +1855,37 @@ function animateMonster(m, dt) {
   if (m.flash > 0) em = RED.clone().multiplyScalar(1.2);
   for (const mt of mats) mt.emissive.copy(em);
 }
-function animateWorld(dt) {
+// 被牆擋住的物件不送進 GPU(關卡是格子地圖,用視線檢查就很準)
+let visTimer = 0;
+function entObject(e) { return e.kind === 'monster' ? e.mdl.root : e.kind === 'pickup' ? e.mesh.root : e.kind === 'barrel' ? e.mesh : null; }
+function canSee(x, z, r) {
+  const dx = x - player.x, dz = z - player.z, d = Math.hypot(dx, dz);
+  if (d < 2.5) return true;
+  if (d > 50) return false;
+  if (lineOfSight(player.x, player.z, x, z)) return true;
+  const px = -dz / d * r, pz = dx / d * r;
+  return lineOfSight(player.x, player.z, x + px, z + pz) || lineOfSight(player.x, player.z, x - px, z - pz);
+}
+function updateVisibility(dt, force) {
+  visTimer -= dt;
+  if (visTimer > 0 && !force) return;
+  visTimer = 0.1;
   for (const e of ents) {
-    if (e.kind === 'monster') animateMonster(e, dt);
-    else if (e.kind === 'pickup') { e.mesh.spin.rotation.y += dt * 1.6; e.mesh.spin.position.y = 0.5 + Math.sin(time * 2.5 + e.phase) * 0.08; }
+    const o = entObject(e); if (!o || e.gibbed) continue;
+    e.culled = !canSee(e.x, e.z, (e.r || 0.5) + 0.6);
+    o.visible = !e.culled;
   }
-  wallMats[6].emissiveIntensity = 0.32 + Math.sin(time * 2.2) * 0.22;
+}
+function animateWorld(dt) {
+  updateVisibility(dt);
+  for (const e of ents) {
+    if (e.culled) continue;
+    if (e.kind === 'monster') {
+      e.tintT -= dt; if (e.tintT <= 0 && e.state !== 'dead') { e.tintT = 0.3; tintMonster(e); }
+      animateMonster(e, dt);
+    } else if (e.kind === 'pickup') { e.mesh.spin.rotation.y += dt * 1.6; e.mesh.spin.position.y = 0.5 + Math.sin(time * 2.5 + e.phase) * 0.08; }
+  }
+  bakedMats[6].emissiveIntensity = 0.32 + Math.sin(time * 2.2) * 0.22;
 }
 function animateWeapon(dt) {
   const mdl = wModels[player.cur]; if (!mdl) return;
@@ -1766,7 +1902,7 @@ function animateWeapon(dt) {
   muzzleSprite.position.set(u.muzzle[0], u.muzzle[1], u.muzzle[2]);
   muzzleSprite.scale.setScalar((player.cur === 2 ? 0.5 : 0.32) * (0.8 + rand() * 0.4));
 }
-let mouseDXFrame = 0, mouseDYFrame = 0;
+let mouseDXFrame = 0, mouseDYFrame = 0, mapTimer = 0;
 
 // ============================================================
 //  HUD
@@ -1793,12 +1929,14 @@ function updateHUD(force) {
   setText('hudObj', '');
   const objText = bossAlive ? `擊敗地獄男爵　擊殺 ${player.kills}/${totalMonsters}` : `找到出口　擊殺 ${player.kills}/${totalMonsters}`;
   if (hudCache.obj !== objText) { hudCache.obj = objText; $('hudObj').innerHTML = objText.replace(/(\d+\/\d+)/, '<b>$1</b>'); }
-  $('lowhp').classList.toggle('on', player.health > 0 && player.health <= 25);
+  const low = player.health > 0 && player.health <= 25;
+  if (hudCache.low !== low) { hudCache.low = low; $('lowhp').classList.toggle('on', low); }
   setStyle('vig', 'opacity', String(Math.min(1, hurtFx).toFixed(2)));
   setStyle('pickFlash', 'opacity', String(pickFx.toFixed(2)));
-  $('cross').style.setProperty('--s', (6 + crossBloom * 14 + moveAmt * 4).toFixed(1) + 'px');
+  const cs = Math.round(6 + crossBloom * 14 + moveAmt * 4) + 'px';
+  if (hudCache.cross !== cs) { hudCache.cross = cs; $('cross').style.setProperty('--s', cs); }
   const bossNear = boss && boss.state !== 'idle' && boss.state !== 'dead';
-  $('bossbar').hidden = !bossNear;
+  if (hudCache.bossNear !== bossNear) { hudCache.bossNear = bossNear; $('bossbar').hidden = !bossNear; }
   if (bossNear) setStyle('bossHp', 'width', (boss.hp / boss.def.hp * 100).toFixed(1) + '%');
 }
 const mm = $('minimap'), mctx = mm.getContext('2d');
@@ -1827,13 +1965,19 @@ function drawMinimap() {
 //  主迴圈
 // ============================================================
 let last = performance.now();
+let last0 = performance.now();
 function frame(now) {
+  const rawPrev = last0; last0 = now; const _raw = now - rawPrev;
   const dt = Math.min(0.05, (now - last) / 1000); last = now; time += dt;
   mouseDXFrame = mouseDX; mouseDYFrame = mouseDY;
-  if (state === 'play') update(dt);
+  if (state === 'play') { update(dt); adaptResolution(Math.min(0.2, _raw / 1000)); }
   else if (state === 'title') { player.yaw += dt * 0.12; mouseDX = mouseDY = 0; }
   else { mouseDX = mouseDY = 0; }
   if (state === 'play' || state === 'title') { fxAdd.update(dt); fxNorm.update(dt); animateWorld(dt); }
+  renderFrame(dt);
+  requestAnimationFrame(frame);
+}
+function renderFrame(dt) {
   updateLights(state === 'play' || state === 'title' ? dt : 0);
   animateWeapon(dt);
   // 相機
@@ -1842,7 +1986,7 @@ function frame(now) {
   camera.position.set(player.x + (rand() - 0.5) * sk, eyeY() + bob + (player.dead ? -1.2 : 0) + (rand() - 0.5) * sk, player.z + (rand() - 0.5) * sk);
   camera.rotation.set(player.pitch + recoil * 0.02 + (rand() - 0.5) * sk * 0.3, player.yaw, (player.dead ? 0.5 : 0) + (rand() - 0.5) * sk * 0.3 - swayX * 0.4);
   wRoot.visible = state === 'play' || state === 'paused' || state === 'settings';
-  if (state === 'play') drawMinimap();
+  if (state === 'play' && (mapTimer -= dt) <= 0) { mapTimer = 0.1; drawMinimap(); }
   if (composer) {
     finalPass.uniforms.time.value = time % 100;
     finalPass.uniforms.hurt.value = hurtFx;
@@ -1853,7 +1997,6 @@ function frame(now) {
     renderer.clearDepth();
     renderer.render(wScene, wCam);
   }
-  requestAnimationFrame(frame);
 }
 
 // ---------- 啟動 ----------
@@ -1864,7 +2007,7 @@ function boot() {
   buildLights();
   fxAdd = new Particles(1500, THREE.AdditiveBlending);
   fxNorm = new Particles(1500, THREE.NormalBlending);
-  resize();
+  applyQuality();
   loadLevel(0);
   $('loading').remove();
   setState('title');
