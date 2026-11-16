@@ -1,5 +1,7 @@
 # 毀滅戰士 JS
 
+**線上遊玩：<https://fa3go.github.io/Doom/>**（經典版：<https://fa3go.github.io/Doom/classic.html>）
+
 仿《毀滅戰士》(DOOM)的第一人稱射擊遊戲，有兩個版本：
 
 | 檔案 | 版本 | 技術 |
